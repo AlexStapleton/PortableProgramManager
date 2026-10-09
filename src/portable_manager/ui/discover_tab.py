@@ -162,8 +162,8 @@ def fork_label(repo: GitHubRepo) -> tuple[str, str]:
     if repo.ahead_by is None:
         return (
             f"{repo.full_name} · fork",
-            "Fork — not compared with the original yet (or GitHub's rate limit was reached).\n"
-            f"{repo.html_url}",
+            "Fork — not compared with the original (still loading, API limit reached, "
+            f"or the site can't compare forks).\n{repo.html_url}",
         )
     text = f"{repo.full_name} · fork +{repo.ahead_by} / −{repo.behind_by or 0}"
     tooltip = (
@@ -564,8 +564,8 @@ class DiscoverTab(QWidget):
         if uncompared:
             message = (
                 f"{uncompared} fork(s) couldn't be compared with the original, so they are shown "
-                "unfiltered. GitHub's rate limit was probably reached; add a token in "
-                "Settings → GitHub to raise it."
+                "unfiltered. Either the site's API limit was reached (add a token in Settings → "
+                "Sources) or the site can't compare forks (Codeberg/Gitea servers often can't)."
             )
             self._host.set_status(message)
             self._append_log(message)

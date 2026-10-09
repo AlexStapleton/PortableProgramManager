@@ -367,8 +367,10 @@ class GitHubClient:
         return self._release_from_api(self._parse_json(response))
 
     # Asset name patterns that indicate a Windows build.
+    # "win" only counts as its own word ("app-win64.zip", "windows"), not inside
+    # "darwin" or "twinkle".
     _WIN_ASSET_RE = re.compile(
-        r"(win|windows|win32|win64|x86_64.*pc.*windows|msvc|mingw"
+        r"((?<![a-z])win(?:dows|32|64)?(?![a-z])|x86_64.*pc.*windows|msvc|mingw"
         r"|\.msi\b|\.msix\b|\.appx\b|\.appxbundle\b|\.exe\b|setup\.zip)",
         re.IGNORECASE,
     )
