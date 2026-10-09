@@ -17,3 +17,6 @@ dist/
 # Archives / runtime data
 *.zip
 *.log
+
+# Agent worktrees
+.claude/worktrees/
