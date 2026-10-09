@@ -135,3 +135,60 @@ def test_ensure_install_root_writable_is_checked(installer, tmp_path, monkeypatc
     monkeypatch.setattr(installer, "_download", lambda *a, **k: pytest.fail("must not download"))
     with pytest.raises(InstallError, match="administrator"):
         installer.install_from_repo("o/App")
+
+
+def test_digest_from_github_client_is_enforced():
+    """Contract between GitHubClient (stores bare hex) and the installer's integrity check."""
+    from portable_manager.github_client import GitHubClient
+    from portable_manager.installer import _expected_sha256
+
+    hexdigest = "ab" * 32
+    release = GitHubClient._release_from_api({
+        "id": 1, "tag_name": "v1", "assets": [
+            {"name": "a.zip", "browser_download_url": "https://x/a.zip", "size": 1, "digest": f"sha256:{hexdigest.upper()}"},
+        ],
+    })
+    assert _expected_sha256(release.assets[0]) == hexdigest
+
+
+def _program_for(install_dir: Path, **kw) -> ManagedProgram:
+    return ManagedProgram(
+        program_id="p", name="Tool", source_type="github_repo", source_value="o/tool",
+        install_dir=str(install_dir), launch_path=str(install_dir / "Tool.exe"), **kw,
+    )
+
+
+def test_prefetched_update_is_used_and_kept_for_caller(installer, tmp_path, monkeypatch):
+    install_dir = Path(installer.settings.install_root) / "Tool"
+    install_dir.mkdir(parents=True)
+    (install_dir / "Tool.exe").write_text("old")
+    pending = tmp_path / "pending" / "Tool.exe"
+    pending.parent.mkdir()
+    pending.write_text("new")
+    monkeypatch.setattr(installer, "_download", lambda *a, **k: pytest.fail("must not download"))
+    release = GitHubRelease(1, "v2", "v2", "", "", False, [])
+    asset = GitHubReleaseAsset("Tool.exe", "https://x/Tool.exe", 3, "")
+
+    updated = installer.download_and_install_release(
+        _program_for(install_dir, installed_asset_name="Tool.exe", installed_hash="sha256:old"),
+        release, asset, prefetched=(pending, "newhash"),
+    )
+    assert (install_dir / "Tool.exe").read_text() == "new"
+    assert updated.version == "v2" and updated.installed_hash == "sha256:newhash"
+
+
+def test_identical_update_raises_already_up_to_date(installer, tmp_path, monkeypatch):
+    from portable_manager.errors import AlreadyUpToDateError
+
+    install_dir = Path(installer.settings.install_root) / "Tool"
+    install_dir.mkdir(parents=True)
+    dl = tmp_path / "dl_x" / "Tool.exe"
+    dl.parent.mkdir()
+    dl.write_text("same")
+    monkeypatch.setattr(installer, "_download", lambda *a, **k: (dl, "samehash"))
+    with pytest.raises(AlreadyUpToDateError):
+        installer.download_and_install_release(
+            _program_for(install_dir, installed_hash="sha256:samehash"),
+            GitHubRelease(1, "v2", "v2", "", "", False, []),
+            GitHubReleaseAsset("Tool.exe", "https://x/Tool.exe", 4, ""),
+        )

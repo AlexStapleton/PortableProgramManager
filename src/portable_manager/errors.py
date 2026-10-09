@@ -11,3 +11,7 @@ class ProgramInUseError(InstallError):
     def __init__(self, message: str, process_names: list[str] | None = None) -> None:
         super().__init__(message)
         self.process_names = process_names or []
+
+
+class AlreadyUpToDateError(InstallError):
+    """The downloaded update is byte-identical to what is already installed."""

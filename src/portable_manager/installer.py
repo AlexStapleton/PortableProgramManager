@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 import requests
 
 from . import fsops
-from .errors import InstallError, ProgramInUseError
+from .errors import AlreadyUpToDateError, InstallError, ProgramInUseError
 from .github_client import USER_AGENT, GitHubClient, GitHubRelease, GitHubReleaseAsset
 from .models import AppSettings, ManagedProgram, UpdatePolicy
 
@@ -235,17 +235,29 @@ class PortableInstaller:
         release: GitHubRelease,
         asset: GitHubReleaseAsset,
         progress_callback: ProgressCallback = None,
+        prefetched: tuple[Path, str] | None = None,
     ) -> ManagedProgram:
         """Download *asset* and apply it over *program*'s folder.
 
         *program* should be a snapshot (not the controller's live object); it is
         updated in place and returned so the caller can commit it under its lock.
+        *prefetched* is ``(file, sha256_hex)`` of an already-downloaded copy of
+        *asset* ("download only" mode); the caller owns and deletes that file.
         """
         install_dir = Path(program.install_dir)
-        downloaded_file, downloaded_hash = self._download(
-            asset.download_url, asset.name, progress_callback=progress_callback,
-            expected_sha256=_expected_sha256(asset),
-        )
+        if prefetched is not None:
+            downloaded_file, downloaded_hash = prefetched
+            expected = _expected_sha256(asset)
+            if expected and downloaded_hash and expected != downloaded_hash.lower():
+                raise InstallError(
+                    f"The downloaded update for {program.name} no longer matches the release on GitHub. "
+                    "Check for updates again to download it fresh."
+                )
+        else:
+            downloaded_file, downloaded_hash = self._download(
+                asset.download_url, asset.name, progress_callback=progress_callback,
+                expected_sha256=_expected_sha256(asset),
+            )
         try:
             # Verify the download differs from what is already installed.
             # An identical hash may indicate a replayed or stale download.
@@ -255,9 +267,9 @@ class PortableInstaller:
                     "Update download for %s has identical hash to the installed version (%s); skipping.",
                     program.name, new_hash,
                 )
-                raise InstallError(
+                raise AlreadyUpToDateError(
                     "The downloaded update is identical to the currently installed version "
-                    "(same SHA-256 hash). The update was skipped."
+                    "(same SHA-256 hash), so there was nothing to install."
                 )
             name_hints = [
                 hint for hint in (
@@ -272,7 +284,8 @@ class PortableInstaller:
                 name_hints=name_hints, previous_launch_relpath=_launch_relpath(program),
             )
         finally:
-            self._discard_download(downloaded_file)
+            if prefetched is None:
+                self._discard_download(downloaded_file)
 
         self._remove_superseded_single_file(program, asset.name, launch_path)
         program.launch_path = str(launch_path) if launch_path else program.launch_path
@@ -496,7 +509,9 @@ class PortableInstaller:
             stem_key = _normalise_name(p.stem)
             if hints and stem_key in hints:
                 hint_rank = 2
-            elif hints and any(stem_key and (stem_key in h or h in stem_key) for h in hints):
+            elif hints and len(stem_key) >= 3 and any(
+                len(h) >= 3 and (stem_key in h or h in stem_key) for h in hints
+            ):
                 hint_rank = 1
             else:
                 hint_rank = 0
@@ -793,16 +808,21 @@ def _name_tokens(name: str) -> list[str]:
 def _is_installer_stem(stem: str) -> bool:
     if _INSTALLER_STEM_RE.match(stem):
         return True
-    return any(token in _INSTALLER_TOKENS for token in _name_tokens(stem))
+    if any(token in _INSTALLER_TOKENS for token in _name_tokens(stem)):
+        return True
+    # Glued lowercase names such as "myappsetup" have no token boundary.
+    lowered = stem.lower()
+    return not lowered.startswith("unins") and lowered.endswith(("setup", "installer"))
 
 
 def _expected_sha256(asset: GitHubReleaseAsset) -> str:
     """The hex SHA-256 GitHub publishes for *asset*, or "" when there isn't one."""
-    digest = str(getattr(asset, "digest", "") or "").strip()
+    digest = str(getattr(asset, "digest", "") or "").strip().lower()
     algorithm, sep, value = digest.partition(":")
-    if sep and algorithm.lower() == "sha256":
-        return value.strip()
-    return ""
+    if sep:
+        return value.strip() if algorithm == "sha256" else ""
+    # GitHubClient already strips the "sha256:" prefix and stores bare hex.
+    return digest if re.fullmatch(r"[0-9a-f]{64}", digest) else ""
 
 
 def _normalise_sha256(value: str) -> str:

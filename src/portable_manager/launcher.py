@@ -22,6 +22,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import fsops
 from .errors import InstallError
 from .models import ManagedProgram
 
@@ -40,6 +41,12 @@ _AV_HINT = (
     "This usually means antivirus (for example Windows Security) blocked or quarantined it. "
     "Check Windows Security → Virus & threat protection → Protection history, and restore or "
     "allow the file if you trust it."
+)
+
+PERMISSION_PROBLEM_MESSAGE = (
+    "Some of {name}'s files can't be opened by your Windows account. This happens to programs "
+    "installed by an older version of this app, especially when it was run as administrator. "
+    'Use "Repair Permissions" to fix it (Windows may ask for administrator approval).'
 )
 
 _dll_dir_lock = threading.Lock()
@@ -84,18 +91,24 @@ def build_launch_spec(program: ManagedProgram) -> LaunchSpec:
     return LaunchSpec(str(launch), args, cwd, verb)
 
 
+def _access_denied(program: ManagedProgram, launch: Path) -> InstallError:
+    if fsops.find_permission_problems(Path(program.install_dir), limit=1):
+        return InstallError(PERMISSION_PROBLEM_MESSAGE.format(name=program.name))
+    return InstallError(f"Windows denied access to {launch}.\n\n{_AV_HINT}")
+
+
 def _check_launch_file(program: ManagedProgram) -> None:
     launch = Path(program.launch_path or "")
     try:
         exists = launch.is_file()
     except PermissionError:
-        raise InstallError(f"Windows denied access to {launch}.\n\n{_AV_HINT}")
+        raise _access_denied(program, launch)
     if exists:
         try:
             with open(launch, "rb"):
                 pass
         except PermissionError:
-            raise InstallError(f"Windows denied access to {launch}.\n\n{_AV_HINT}")
+            raise _access_denied(program, launch)
         except OSError as exc:
             if getattr(exc, "winerror", None) in (_ERROR_VIRUS_INFECTED, _ERROR_VIRUS_DELETED):
                 raise InstallError(f"Windows Security blocked {launch.name} as a potential threat.\n\n{_AV_HINT}")

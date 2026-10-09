@@ -193,3 +193,32 @@ def test_is_within():
     assert fsops.is_within(r"C:\A\B\c.exe", r"C:\a\b")
     assert fsops.is_within(r"C:\A\B", r"C:\A\B")
     assert not fsops.is_within(r"C:\A\BC\c.exe", r"C:\A\B")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACLs")
+def test_permission_problem_detected_and_repaired_without_elevation(tmp_path):
+    """Reproduces the v0.7 damage (protected ACL without the user) on a folder we own."""
+    import subprocess
+
+    folder = tmp_path / "App"
+    _write(folder / "ok.txt", "fine")
+    locked_dir = folder / "data"
+    _write(locked_dir / "save.dat", "x")
+    user = os.environ["USERNAME"]
+    # Remove inheritance and deny ourselves read access, like the broken installs.
+    subprocess.run(["icacls", str(locked_dir), "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F"],
+                   check=True, capture_output=True)
+    try:
+        assert fsops.find_permission_problems(folder) == [locked_dir]
+        assert fsops.repair_permissions(folder, allow_elevation=False) is True
+        assert fsops.find_permission_problems(folder) == []
+        assert (locked_dir / "save.dat").read_text() == "x"
+    finally:
+        subprocess.run(["icacls", str(folder), "/reset", "/T", "/C", "/Q"], capture_output=True)
+        subprocess.run(["icacls", str(folder), "/grant", f"{user}:(OI)(CI)F", "/T", "/C", "/Q"], capture_output=True)
+
+
+def test_permission_scan_ignores_healthy_folder(tmp_path):
+    _write(tmp_path / "App" / "a" / "b.txt", "x")
+    assert fsops.find_permission_problems(tmp_path / "App") == []
+    assert fsops.find_permission_problems(tmp_path / "missing") == []
