@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
@@ -42,9 +43,10 @@ def _sanitize_error(exc: Exception) -> str:
     include the ``Authorization`` token.  We redact that before display.
     """
     msg = str(exc)
-    # Strip anything that looks like a Bearer/token/Basic auth header value.
-    import re
-    msg = re.sub(r"(Bearer|token|Basic)\s+\S+", r"\1 [REDACTED]", msg, flags=re.IGNORECASE)
+    # Redact auth header values and anything shaped like a GitHub token, but
+    # leave ordinary prose ("Set a GitHub token in Settings") alone.
+    msg = re.sub(r"\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}", r"\1 [REDACTED]", msg)
+    msg = re.sub(r"\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})", "[REDACTED]", msg)
     return msg
 
 

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import re
-import threading
+import os
+import subprocess
+import sys
 import time
 import uuid
+from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QCoreApplication
@@ -56,18 +59,21 @@ def test_second_launch_emits_activation_on_primary(qapp, key, instances):
     first.activation_requested.connect(lambda: received.append(True))
     assert first.try_acquire() is True
 
-    # The second launch must run on its own thread: in a real launch it is a
-    # separate process with its own event loop, and a blocking client on this
-    # thread would stop the primary's server from accepting the connection.
-    results: list[bool] = []
-    client = threading.Thread(
-        target=lambda: results.append(SingleInstance(key).try_acquire())
+    # A second launch is a separate process in real life, so test exactly that
+    # (an in-process client thread races the primary's event loop).
+    script = (
+        "import sys\n"
+        "from PySide6.QtCore import QCoreApplication\n"
+        "from portable_manager.single_instance import SingleInstance\n"
+        "app = QCoreApplication([])\n"
+        f"print(SingleInstance({key!r}).try_acquire())\n"
     )
-    client.start()
-    assert _pump_until(lambda: not client.is_alive())
-    client.join()
-
-    assert results == [False]
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+    client = subprocess.Popen(
+        [sys.executable, "-c", script], stdout=subprocess.PIPE, text=True, env=env
+    )
+    assert _pump_until(lambda: client.poll() is not None, timeout=20)
+    assert client.stdout.read().strip() == "False"
     assert _pump_until(lambda: bool(received))
 
 

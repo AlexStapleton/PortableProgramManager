@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import copy
-import shutil
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Callable
 
+from . import fsops
+from .errors import InstallError, ProgramInUseError
 from .github_client import GitHubClient, GitHubRepo
-from .installer import InstallError, PortableInstaller
+from .installer import PortableInstaller, normalize_dir
+from .launcher import launch_program
 from .models import AppSettings, ManagedProgram, UpdatePolicy
 from .storage import Storage
 
 ProgressCallback = Callable[[int, str], None] | None
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -22,6 +27,21 @@ class InstallOutcome:
     any advisory flags the UI should act on."""
     program: ManagedProgram
     is_likely_installer: bool = False
+
+
+@dataclass
+class RemoveOutcome:
+    program_name: str
+    deleted_files: bool
+    warnings: list[str] = field(default_factory=list)
+
+
+# Fields an update install changes; committed from the worker's snapshot.
+_INSTALL_STATE_FIELDS = (
+    "launch_path", "installed_hash", "version", "asset_name", "installed_asset_url",
+    "installed_asset_name", "installed_asset_size", "latest_upstream_version",
+    "latest_upstream_published_at", "update_available", "update_available_asset_name",
+)
 
 
 class AppController:
@@ -36,8 +56,10 @@ class AppController:
 
     def reload_clients(self) -> None:
         with self._lock:
+            old = self.github
             self.github = GitHubClient(token=self.settings.github_token)
             self.installer = PortableInstaller(self.settings, self.github)
+        old.close()
 
     def _get_github(self) -> GitHubClient:
         """Return the shared GitHubClient, creating/replacing it only when the token changes."""
@@ -80,9 +102,12 @@ class AppController:
     ) -> InstallOutcome:
         with self._lock:
             installer = self.installer
-        result = installer.install_from_repo(repo_full_name, channel=channel, progress_callback=progress_callback)
+            taken = self._taken_dirs_no_lock()
+        result = installer.install_from_repo(
+            repo_full_name, channel=channel, progress_callback=progress_callback, taken_dirs=taken
+        )
         self._upsert_program(result.program)
-        return InstallOutcome(program=result.program, is_likely_installer=result.is_likely_installer)
+        return InstallOutcome(program=copy.deepcopy(result.program), is_likely_installer=result.is_likely_installer)
 
     def install_from_url(
         self,
@@ -92,39 +117,86 @@ class AppController:
     ) -> InstallOutcome:
         with self._lock:
             installer = self.installer
-        result = installer.install_from_url(url, display_name=display_name, progress_callback=progress_callback)
+            taken = self._taken_dirs_no_lock()
+        result = installer.install_from_url(
+            url, display_name=display_name, progress_callback=progress_callback, taken_dirs=taken
+        )
         self._upsert_program(result.program)
-        return InstallOutcome(program=result.program, is_likely_installer=result.is_likely_installer)
+        return InstallOutcome(program=copy.deepcopy(result.program), is_likely_installer=result.is_likely_installer)
 
-    def run_program(self, program_id: str) -> ManagedProgram:
-        # Take a snapshot of the program under the lock, then release before
-        # launching so a UAC prompt doesn't block the entire controller.
+    def run_program(self, program_id: str, progress_callback: ProgressCallback = None) -> ManagedProgram:
+        """Launch a program. Blocks while a UAC prompt is open, so run it in a worker."""
+        # Take a snapshot under the lock, then release it before launching so a
+        # UAC prompt doesn't block the entire controller.
         with self._lock:
-            program = self._get_program_no_lock(program_id)
-            snapshot = copy.deepcopy(program)
-        PortableInstaller.run_program(snapshot)
+            snapshot = copy.deepcopy(self._get_program_no_lock(program_id))
+        if progress_callback:
+            progress_callback(50, f"Starting {snapshot.name}...")
+        launch_program(snapshot)
         with self._lock:
             program = self._get_program_no_lock(program_id)
             program.last_run_at = datetime.now(timezone.utc).isoformat()
             self.storage.save_programs(self.programs)
-            return program
+            return copy.deepcopy(program)
 
-    def remove_program(self, program_id: str, delete_files: bool = False) -> None:
+    def remove_program(
+        self,
+        program_id: str,
+        delete_files: bool = False,
+        progress_callback: ProgressCallback = None,
+    ) -> RemoveOutcome:
+        """Remove a program from the registry and optionally delete its folder.
+
+        With *delete_files*, the folder is first renamed aside (which fails
+        cleanly if anything inside is in use); only then is the registry entry
+        removed and the renamed folder deleted. Nothing is removed if the
+        folder is unsafe to delete or the program is running.
+        """
+        with self._lock:
+            program = self._get_program_no_lock(program_id)
+            name = program.name
+            install_dir = Path(program.install_dir)
+            other_dirs = [p.install_dir for p in self.programs if p.program_id != program_id]
+            install_root = Path(self.settings.install_root)
+
+        trash: Path | None = None
+        if delete_files and install_dir.exists():
+            reason = fsops.unsafe_delete_reason(install_dir, install_root, other_dirs)
+            if reason:
+                raise InstallError(
+                    f"For safety, {install_dir} was not deleted because {reason}. "
+                    "Use 'Remove only' and delete the files yourself if you're sure."
+                )
+            if progress_callback:
+                progress_callback(20, f"Checking that {name} isn't running...")
+            running = fsops.find_running_processes(install_dir)
+            if running:
+                raise ProgramInUseError(fsops.in_use_message("delete", name, running), running)
+            trash = fsops.stage_for_deletion(install_dir, name)
+
         with self._lock:
             removed = self._program_index.pop(program_id, None)
-            install_dir = removed.install_dir if removed else None
-            self.programs = [p for p in self.programs if p.program_id != program_id]
-            self.storage.save_programs(self.programs)
-            # Delete inside the lock so another thread can't re-install to the
-            # same directory between the registry save and the file deletion.
-            if delete_files and install_dir:
-                try:
-                    shutil.rmtree(Path(install_dir), ignore_errors=False)
-                except OSError as exc:
-                    raise InstallError(
-                        f"Program was removed from the registry, but its files "
-                        f"could not be deleted: {exc}"
-                    )
+            if removed is not None:
+                self.programs = [p for p in self.programs if p.program_id != program_id]
+                self.storage.save_programs(self.programs)
+
+        outcome = RemoveOutcome(program_name=name, deleted_files=delete_files)
+        if trash is not None:
+            if progress_callback:
+                progress_callback(60, f"Deleting {install_dir}...")
+            warning = fsops.delete_staged(trash)
+            if warning:
+                outcome.warnings.append(warning)
+        return outcome
+
+    def cleanup_stale_temp_dirs(self, progress_callback: ProgressCallback = None) -> int:
+        """Delete leftover staging/backup/trash folders from interrupted operations."""
+        with self._lock:
+            roots = {normalize_dir(self.settings.install_root): Path(self.settings.install_root)}
+            for program in self.programs:
+                parent = Path(program.install_dir).parent
+                roots.setdefault(normalize_dir(parent), parent)
+        return sum(fsops.cleanup_stale_temp_dirs(root) for root in roots.values())
 
     def edit_program(
         self,
@@ -156,15 +228,18 @@ class AppController:
             return copy.deepcopy(self._get_program_no_lock(program_id))
 
     def list_programs(self) -> list[ManagedProgram]:
+        """Return copies, so the UI never reads objects a worker is mutating."""
         with self._lock:
-            return list(self.programs)
+            return copy.deepcopy(self.programs)
 
     def update_settings(self, settings: AppSettings) -> None:
         with self._lock:
             self.settings = settings
             self.storage.save_settings(settings)
+            old_github = self.github
             self.github = GitHubClient(token=self.settings.github_token)
             self.installer = PortableInstaller(self.settings, self.github)
+            old_github.close()
             updated = False
             for program in self.programs:
                 policy = program.update_policy
@@ -212,7 +287,7 @@ class AppController:
                 self.storage.save_programs(self.programs)
             if progress_callback:
                 progress_callback(100, f"Update checks are not supported for {program_name}")
-            return program
+            return self.get_program(program_id)
 
         try:
             release = self._get_github().get_latest_release(
@@ -262,7 +337,7 @@ class AppController:
 
         if progress_callback:
             progress_callback(100, f"Finished checking {program_name}")
-        return program
+        return self.get_program(program_id)
 
     def check_for_updates_all(self, progress_callback: ProgressCallback = None) -> list[ManagedProgram]:
         with self._lock:
@@ -363,16 +438,20 @@ class AppController:
                 raise InstallError(program.last_error_message or "Update check failed.")
             raise InstallError("No update is currently available for this program.")
 
-        # Read all state needed for the download under the lock.
+        # Work on a snapshot so the UI never sees a half-updated record.
         with self._lock:
-            program = self._get_program_no_lock(program_id)
-            repo_full_name = program.repo_full_name
-            channel = program.update_policy.channel
-            asset_hint = (
-                program.installed_asset_name
-                or program.asset_name
-                or program.update_policy.asset_selection_override
-            )
+            snapshot = copy.deepcopy(self._get_program_no_lock(program_id))
+        repo_full_name = snapshot.repo_full_name
+        channel = snapshot.update_policy.channel
+        asset_hint = (
+            snapshot.installed_asset_name
+            or snapshot.asset_name
+            or snapshot.update_policy.asset_selection_override
+        )
+
+        running = fsops.find_running_processes(Path(snapshot.install_dir))
+        if running:
+            raise ProgramInUseError(fsops.in_use_message("update", snapshot.name, running), running)
 
         github = self._get_github()
         release = github.get_latest_release(repo_full_name, include_prereleases=channel == "prerelease")
@@ -386,16 +465,20 @@ class AppController:
         try:
             with self._lock:
                 installer = self.installer
-            installer.download_and_install_release(program, release, asset, progress_callback=progress_callback)
+            updated = installer.download_and_install_release(snapshot, release, asset, progress_callback=progress_callback)
             with self._lock:
-                # Re-lookup: program reference may be stale after the download.
+                # Copy the new install state onto the live record, keeping anything
+                # the user edited meanwhile (name, notes, policy...).
                 program = self._get_program_no_lock(program_id)
+                for field_name in _INSTALL_STATE_FIELDS:
+                    setattr(program, field_name, getattr(updated, field_name))
                 program.last_checked_at = now
                 program.last_update_attempt_at = now
                 program.last_update_status = "updated"
                 program.last_error_message = None
                 program.last_error_at = None
                 self.storage.save_programs(self.programs)
+                result = copy.deepcopy(program)
         except KeyError:
             raise
         except Exception as exc:
@@ -411,8 +494,8 @@ class AppController:
             raise
 
         if progress_callback:
-            progress_callback(100, f"Updated {program.name}")
-        return program
+            progress_callback(100, f"Updated {result.name}")
+        return result
 
     @staticmethod
     def _normalize_version(v: str) -> str:
@@ -455,6 +538,9 @@ class AppController:
                 self.programs.append(program)
             self._program_index[program.program_id] = program
             self.storage.save_programs(self.programs)
+
+    def _taken_dirs_no_lock(self) -> dict[str, str]:
+        return {normalize_dir(p.install_dir): p.program_id for p in self.programs}
 
     def _get_program_no_lock(self, program_id: str) -> ManagedProgram:
         try:

@@ -11,6 +11,7 @@ import requests
 API_ROOT = "https://api.github.com"
 DEFAULT_TIMEOUT = 30
 MAX_RETRIES = 3
+USER_AGENT = "PortableProgramManager/0.8"
 REPO_URL_RE = re.compile(r"https?://github\.com/([^/]+)/([^/#?]+)")
 # Validates that a full_name looks like "owner/repo" with safe characters only.
 _REPO_FULL_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
@@ -58,7 +59,7 @@ class GitHubClient:
             {
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "PortableProgramManager/0.7",
+                "User-Agent": USER_AGENT,
             }
         )
         if token:

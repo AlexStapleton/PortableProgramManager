@@ -1,17 +1,13 @@
 from __future__ import annotations
 
-import ctypes
 import hashlib
 import logging
 import os
-import platform
 import re
-import shlex
 import shutil
 import subprocess
+import uuid
 import zipfile
-
-import py7zr
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -19,10 +15,17 @@ from urllib.parse import urlparse
 
 import requests
 
-from .github_client import GitHubClient, GitHubRelease, GitHubReleaseAsset
+from . import fsops
+from .errors import InstallError, ProgramInUseError
+from .github_client import USER_AGENT, GitHubClient, GitHubRelease, GitHubReleaseAsset
 from .models import AppSettings, ManagedProgram, UpdatePolicy
 
+__all__ = ["InstallError", "ProgramInUseError", "InstallResult", "PortableInstaller"]
+
+log = logging.getLogger(__name__)
+
 PORTABLE_EXTENSIONS = {".exe", ".zip", ".7z", ".bat", ".cmd"}
+ARCHIVE_EXTENSIONS = {".zip", ".7z"}
 EXECUTABLE_EXTENSIONS = {".exe", ".bat", ".cmd"}
 SCRIPT_EXTENSIONS = {".ps1"}  # runnable via powershell, lower priority than native executables
 ProgressCallback = Callable[[int, str], None] | None
@@ -36,24 +39,8 @@ _WINDOWS_RESERVED_NAMES = frozenset({
 
 _INSTALLER_HINTS = {"setup", "install", "installer", "unins", "update"}
 
-# Characters that are special to cmd.exe and must cause quoting.
-_CMD_SHELL_META = set('&|<>^()%!"')
-
-
-def _quote_args_for_shell(args: list[str]) -> str:
-    """Join pre-parsed argument tokens into a safely quoted command string
-    suitable for the *params* argument of ``ShellExecuteW``.
-
-    Each token is wrapped in double quotes and internal double-quotes are
-    escaped with a backslash (the Windows convention).  This prevents shell
-    metacharacters like ``&``, ``|``, ``>``, ``^`` from being interpreted.
-    """
-    quoted: list[str] = []
-    for arg in args:
-        # Always quote to neutralise any shell metacharacters.
-        escaped = arg.replace('"', '\\"')
-        quoted.append(f'"{escaped}"')
-    return " ".join(quoted)
+# Keeps console programs we call (7z.exe) from flashing a window in the GUI build.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 @dataclass
@@ -61,10 +48,6 @@ class InstallResult:
     program: ManagedProgram
     downloaded_file: Path
     is_likely_installer: bool = False
-
-
-class InstallError(RuntimeError):
-    pass
 
 
 class PortableInstaller:
@@ -77,6 +60,7 @@ class PortableInstaller:
         repo_full_name: str,
         channel: str = "latest_release",
         progress_callback: ProgressCallback = None,
+        taken_dirs: dict[str, str] | None = None,
     ) -> InstallResult:
         if progress_callback:
             progress_callback(5, f"Loading repository {repo_full_name}")
@@ -89,11 +73,14 @@ class PortableInstaller:
         if not asset:
             raise InstallError("No portable release asset was found. Try installing from a direct asset URL.")
 
-        program_name = self._safe_name(repo.name)
-        install_dir = Path(self.settings.install_root) / program_name
-        downloaded_file, downloaded_hash = self._download(asset.download_url, Path(self.settings.download_cache), asset.name, progress_callback=progress_callback)
-        launch_path = self._materialize_asset(downloaded_file, install_dir, progress_callback=progress_callback)
-        self._cleanup_cached_file(downloaded_file)
+        program_id = f"repo::{repo.full_name.lower()}"
+        install_dir = self._choose_install_dir(self._safe_name(repo.name), program_id, taken_dirs)
+        fsops.ensure_writable_dir(Path(self.settings.install_root))
+        downloaded_file, downloaded_hash = self._download(asset.download_url, asset.name, progress_callback=progress_callback)
+        try:
+            launch_path = self._materialize_asset(downloaded_file, install_dir, progress_callback=progress_callback)
+        finally:
+            self._discard_download(downloaded_file)
 
         is_installer = self.looks_like_installer(launch_path, install_dir)
         # If the asset is an installer/setup, force update policy to manual
@@ -115,7 +102,7 @@ class PortableInstaller:
             )
 
         program = ManagedProgram(
-            program_id=f"repo::{repo.full_name.lower()}",
+            program_id=program_id,
             name=repo.name,
             source_type="github_repo",
             source_value=repo.full_name,
@@ -147,6 +134,7 @@ class PortableInstaller:
         url: str,
         display_name: str | None = None,
         progress_callback: ProgressCallback = None,
+        taken_dirs: dict[str, str] | None = None,
     ) -> InstallResult:
         parsed = urlparse(url)
         if parsed.scheme != "https":
@@ -162,10 +150,14 @@ class PortableInstaller:
             raise InstallError("URL does not point to a supported portable asset type (.exe, .zip, .7z, .bat, .cmd).")
 
         program_name = self._safe_name(display_name or Path(file_name).stem)
-        install_dir = Path(self.settings.install_root) / program_name
-        downloaded_file, downloaded_hash = self._download(url, Path(self.settings.download_cache), file_name, progress_callback=progress_callback)
-        launch_path = self._materialize_asset(downloaded_file, install_dir, progress_callback=progress_callback)
-        self._cleanup_cached_file(downloaded_file)
+        program_id = f"url::{program_name.lower()}::{hashlib.sha256(url.encode()).hexdigest()[:16]}"
+        install_dir = self._choose_install_dir(program_name, program_id, taken_dirs)
+        fsops.ensure_writable_dir(Path(self.settings.install_root))
+        downloaded_file, downloaded_hash = self._download(url, file_name, progress_callback=progress_callback)
+        try:
+            launch_path = self._materialize_asset(downloaded_file, install_dir, progress_callback=progress_callback)
+        finally:
+            self._discard_download(downloaded_file)
 
         repo_full_name = self.github.infer_repo_from_asset_url(url)
         is_installer = self.looks_like_installer(launch_path, install_dir)
@@ -183,7 +175,7 @@ class PortableInstaller:
             )
 
         program = ManagedProgram(
-            program_id=f"url::{program_name.lower()}::{hashlib.sha256(url.encode()).hexdigest()[:16]}",
+            program_id=program_id,
             name=program_name,
             source_type="direct_url",
             source_value=url,
@@ -211,28 +203,31 @@ class PortableInstaller:
         asset: GitHubReleaseAsset,
         progress_callback: ProgressCallback = None,
     ) -> ManagedProgram:
+        """Download *asset* and apply it over *program*'s folder.
+
+        *program* should be a snapshot (not the controller's live object); it is
+        updated in place and returned so the caller can commit it under its lock.
+        """
         install_dir = Path(program.install_dir)
-        downloaded_file, downloaded_hash = self._download(
-            asset.download_url,
-            Path(self.settings.download_cache),
-            asset.name,
-            progress_callback=progress_callback,
-        )
-        # Verify the download differs from what is already installed.
-        # An identical hash may indicate a replayed or stale download.
-        new_hash = f"sha256:{downloaded_hash}"
-        if program.installed_hash and program.installed_hash == new_hash:
-            self._cleanup_cached_file(downloaded_file)
-            logging.getLogger(__name__).warning(
-                "Update download for %s has identical hash to the installed version (%s); skipping.",
-                program.name, new_hash,
-            )
-            raise InstallError(
-                "The downloaded update is identical to the currently installed version "
-                "(same SHA-256 hash). The update was skipped."
-            )
-        launch_path = self._materialize_asset(downloaded_file, install_dir, progress_callback=progress_callback)
-        self._cleanup_cached_file(downloaded_file)
+        downloaded_file, downloaded_hash = self._download(asset.download_url, asset.name, progress_callback=progress_callback)
+        try:
+            # Verify the download differs from what is already installed.
+            # An identical hash may indicate a replayed or stale download.
+            new_hash = f"sha256:{downloaded_hash}"
+            if program.installed_hash and program.installed_hash == new_hash:
+                log.warning(
+                    "Update download for %s has identical hash to the installed version (%s); skipping.",
+                    program.name, new_hash,
+                )
+                raise InstallError(
+                    "The downloaded update is identical to the currently installed version "
+                    "(same SHA-256 hash). The update was skipped."
+                )
+            launch_path = self._materialize_asset(downloaded_file, install_dir, progress_callback=progress_callback)
+        finally:
+            self._discard_download(downloaded_file)
+
+        self._remove_superseded_single_file(program, asset.name, launch_path)
         program.launch_path = str(launch_path) if launch_path else program.launch_path
         program.installed_hash = new_hash
         program.version = release.tag_name or program.version
@@ -250,95 +245,157 @@ class PortableInstaller:
             progress_callback(100, f"Updated {program.name}")
         return program
 
-    def _download(self, url: str, output_dir: Path, file_name: str, progress_callback: ProgressCallback = None) -> tuple[Path, str]:
-        """Download *url* into *output_dir*/*file_name*.
+    @staticmethod
+    def _remove_superseded_single_file(program: ManagedProgram, new_asset_name: str, new_launch: Path | None) -> None:
+        """A single-file asset whose name carries the version (tool-1.2.exe → tool-1.3.exe)
+        would otherwise leave every old copy behind."""
+        old_name = program.installed_asset_name or ""
+        if (
+            not old_name
+            or old_name == new_asset_name
+            or Path(old_name).suffix.lower() in ARCHIVE_EXTENSIONS
+            or Path(new_asset_name).suffix.lower() in ARCHIVE_EXTENSIONS
+        ):
+            return
+        old_file = Path(program.install_dir) / old_name
+        if new_launch is not None and fsops.is_within(old_file, new_launch):
+            return
+        try:
+            if old_file.is_file():
+                fsops.clear_readonly(old_file)
+                old_file.unlink()
+        except OSError:
+            log.info("Couldn't remove superseded file %s", old_file, exc_info=True)
 
-        Returns ``(destination_path, sha256_hex)`` so callers can record the
-        hash for integrity verification.  Cleans up the partial file on failure.
+    def _choose_install_dir(self, base_name: str, program_id: str, taken_dirs: dict[str, str] | None) -> Path:
+        """Pick ``<install root>/<name>``, adding `` (2)``, `` (3)``… when another
+        managed program already owns that folder.
+
+        *taken_dirs* maps ``os.path.normcase``-normalised absolute folder paths
+        to the id of the program that owns them.
         """
-        output_dir.mkdir(parents=True, exist_ok=True)
-        destination = output_dir / file_name
+        root = Path(self.settings.install_root)
+        taken = taken_dirs or {}
+        candidate = root / base_name
+        counter = 2
+        while (owner := taken.get(normalize_dir(candidate))) is not None and owner != program_id:
+            candidate = root / f"{base_name} ({counter})"
+            counter += 1
+        return candidate
+
+    def _download(self, url: str, file_name: str, progress_callback: ProgressCallback = None) -> tuple[Path, str]:
+        """Download *url* into a fresh folder in the download cache.
+
+        Returns ``(path, sha256_hex)``. Every download gets its own folder so two
+        concurrent downloads of identically named assets can't collide. Call
+        :meth:`_discard_download` when done with the file.
+        """
+        download_dir = Path(self.settings.download_cache) / f"dl_{uuid.uuid4().hex[:12]}"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        destination = download_dir / file_name
         if progress_callback:
             progress_callback(10, f"Starting download: {file_name}")
         sha256 = hashlib.sha256()
+        total = downloaded = 0
+        encoded = False
         try:
-            # Limit redirects to prevent abuse and validate the final URL.
-            session = requests.Session()
-            session.max_redirects = 10
-            with session.get(url, stream=True, timeout=120) as response:
-                response.raise_for_status()
-                # Validate that the final URL (after redirects) still uses HTTPS.
-                final_url = response.url
-                if not final_url.startswith("https://"):
-                    raise InstallError(
-                        f"Download aborted: server redirected to a non-HTTPS URL ({final_url[:80]})."
-                    )
-                total = int(response.headers.get("Content-Length", "0") or 0)
-                downloaded = 0
-                with destination.open("wb") as handle:
-                    for chunk in response.iter_content(chunk_size=1024 * 256):
-                        if not chunk:
-                            continue
-                        handle.write(chunk)
-                        sha256.update(chunk)
-                        downloaded += len(chunk)
-                        if progress_callback and total > 0:
-                            percent = 10 + int((downloaded / total) * 70)
-                            progress_callback(min(percent, 80), f"Downloading {file_name} ({downloaded // 1024} KB)")
+            with requests.Session() as session:
+                session.headers["User-Agent"] = USER_AGENT
+                # Limit redirects to prevent abuse and validate the final URL.
+                session.max_redirects = 10
+                with session.get(url, stream=True, timeout=(15, 120)) as response:
+                    response.raise_for_status()
+                    # Validate that the final URL (after redirects) still uses HTTPS.
+                    final_url = response.url
+                    if not final_url.startswith("https://"):
+                        raise InstallError(
+                            f"Download aborted: server redirected to a non-HTTPS URL ({final_url[:80]})."
+                        )
+                    total = int(response.headers.get("Content-Length", "0") or 0)
+                    # requests transparently decompresses gzip/deflate, so the byte
+                    # count can't be compared with Content-Length in that case.
+                    encoded = bool(response.headers.get("Content-Encoding"))
+                    with destination.open("wb") as handle:
+                        for chunk in response.iter_content(chunk_size=1024 * 256):
+                            if not chunk:
+                                continue
+                            handle.write(chunk)
+                            sha256.update(chunk)
+                            downloaded += len(chunk)
+                            if progress_callback and total > 0:
+                                percent = 10 + int((downloaded / total) * 70)
+                                progress_callback(
+                                    min(percent, 80),
+                                    f"Downloading {file_name} ({_format_mb(downloaded)} of {_format_mb(total)})",
+                                )
+            if total > 0 and not encoded and downloaded != total:
+                raise InstallError(
+                    f"Download size mismatch for {file_name}: expected {total} bytes, got {downloaded}."
+                )
+            if downloaded == 0:
+                raise InstallError(f"Downloaded file {file_name} is empty (0 bytes).")
         except BaseException:
             # Remove the incomplete file so it doesn't get mistaken for a valid download.
-            destination.unlink(missing_ok=True)
+            shutil.rmtree(download_dir, ignore_errors=True)
             raise
-        # Verify the downloaded size matches Content-Length (if the server sent one).
-        if total > 0 and downloaded != total:
-            destination.unlink(missing_ok=True)
-            raise InstallError(
-                f"Download size mismatch for {file_name}: expected {total} bytes, got {downloaded}."
-            )
-        if downloaded == 0:
-            destination.unlink(missing_ok=True)
-            raise InstallError(f"Downloaded file {file_name} is empty (0 bytes).")
         if progress_callback:
             progress_callback(85, f"Download complete: {file_name}")
         return destination, sha256.hexdigest()
 
-    @staticmethod
-    def _cleanup_cached_file(path: Path) -> None:
-        """Remove a cached download after successful installation."""
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass  # non-critical — stale cache file is harmless
+    def _discard_download(self, path: Path) -> None:
+        """Remove a downloaded file (and its private folder) from the cache."""
+        parent = path.parent
+        if parent.name.startswith("dl_") and fsops.is_within(parent, self.settings.download_cache):
+            shutil.rmtree(parent, ignore_errors=True)
+        else:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass  # non-critical — stale cache file is harmless
 
     def _materialize_asset(self, downloaded_file: Path, install_dir: Path, progress_callback: ProgressCallback = None) -> Path | None:
-        install_dir.mkdir(parents=True, exist_ok=True)
+        """Unpack/copy *downloaded_file* into *install_dir* and return the launch file.
+
+        The new content is prepared in a staging folder next to *install_dir*
+        and then applied in one all-or-nothing step (see :mod:`fsops`). The
+        launch file is chosen from the *new* content only, so an update can't
+        end up pointing at a file left over from the previous version.
+        """
         suffix = downloaded_file.suffix.lower()
         if progress_callback:
-            progress_callback(88, f"Preparing install folder for {downloaded_file.name}")
+            progress_callback(88, f"Preparing {downloaded_file.name}")
 
-        if suffix == ".zip":
-            try:
-                with zipfile.ZipFile(downloaded_file, "r") as archive:
-                    self._safe_extract_zip(archive, install_dir)
-            except zipfile.BadZipFile as exc:
-                raise InstallError(f"Corrupt or invalid ZIP archive: {exc}")
-            self._flatten_single_subdir(install_dir)
+        staging = fsops.make_staging_dir(install_dir.parent)
+        try:
+            if suffix == ".zip":
+                try:
+                    with zipfile.ZipFile(downloaded_file, "r") as archive:
+                        self._safe_extract_zip(archive, staging)
+                except zipfile.BadZipFile as exc:
+                    raise InstallError(f"Corrupt or invalid ZIP archive: {exc}")
+            elif suffix == ".7z":
+                self._extract_7z(downloaded_file, staging)
+            else:
+                shutil.copy2(downloaded_file, staging / downloaded_file.name)
+
+            if suffix in ARCHIVE_EXTENSIONS:
+                fsops.flatten_single_subdir(staging)
+                if not any(staging.iterdir()):
+                    raise InstallError(f"The archive {downloaded_file.name} is empty.")
+                if progress_callback:
+                    progress_callback(93, f"Extracted {downloaded_file.name}")
+                launch_in_staging = self.guess_launch_executable(staging)
+            else:
+                launch_in_staging = staging / downloaded_file.name
+
+            relative_launch = launch_in_staging.relative_to(staging) if launch_in_staging else None
             if progress_callback:
-                progress_callback(95, f"Extracted {downloaded_file.name}")
-            return self.guess_launch_executable(install_dir)
-
-        if suffix == ".7z":
-            self._extract_7z(downloaded_file, install_dir)
-            self._flatten_single_subdir(install_dir)
-            if progress_callback:
-                progress_callback(95, f"Extracted {downloaded_file.name}")
-            return self.guess_launch_executable(install_dir)
-
-        target = install_dir / downloaded_file.name
-        shutil.copy2(downloaded_file, target)
-        if progress_callback:
-            progress_callback(95, f"Installed {downloaded_file.name}")
-        return target
+                progress_callback(96, f"Installing into {install_dir}")
+            fsops.apply_staged_tree(staging, install_dir)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+        return install_dir / relative_launch if relative_launch else None
 
     @staticmethod
     def guess_launch_executable(install_dir: Path) -> Path | None:
@@ -445,15 +502,17 @@ class PortableInstaller:
         return None
 
     @staticmethod
-    def _validate_7z_members(archive_path: Path, install_dir: Path) -> None:
-        """Check that no member in the .7z archive would escape *install_dir*.
+    def _validate_7z_members(archive_path: Path, dest: Path) -> None:
+        """Check that no member in the .7z archive would escape *dest*.
 
         Mirrors the Zip Slip protection applied to ZIP files.  Symlink entries
         are rejected because on Windows 11 with Developer Mode enabled,
         symlinks can be created without admin privileges and could be used to
         write outside the install directory.
         """
-        resolved_install = install_dir.resolve()
+        import py7zr  # imported lazily: rarely needed and slow to import
+
+        resolved_dest = dest.resolve()
         try:
             with py7zr.SevenZipFile(archive_path, "r") as archive:
                 for entry in archive.list():
@@ -463,8 +522,8 @@ class PortableInstaller:
                             f"7z extraction aborted: archive contains a symlink entry {name!r}. "
                             "Symlinks in archives are a security risk and are not supported."
                         )
-                    target = (install_dir / name).resolve()
-                    if target != resolved_install and not target.is_relative_to(resolved_install):
+                    target = (dest / name).resolve()
+                    if target != resolved_dest and not target.is_relative_to(resolved_dest):
                         raise InstallError(
                             f"7z extraction aborted: entry {name!r} would escape the install directory."
                         )
@@ -479,179 +538,76 @@ class PortableInstaller:
             ) from exc
 
     @staticmethod
-    def _extract_7z(archive_path: Path, install_dir: Path) -> None:
-        """Extract a .7z archive.
+    def _extract_7z(archive_path: Path, dest: Path) -> None:
+        """Extract a .7z archive into *dest* (a fresh staging folder).
 
-        Tries py7zr (pure Python) first.  Falls back to the system 7z.exe when
-        py7zr reports an unsupported compression filter such as BCJ2, which is
-        commonly used in real-world 7z releases.
+        Uses the installed 7-Zip when available (much faster, and it supports
+        every filter), otherwise the pure-Python py7zr.
         """
         # Validate member paths before extraction to prevent path traversal.
-        PortableInstaller._validate_7z_members(archive_path, install_dir)
-
-        try:
-            with py7zr.SevenZipFile(archive_path, "r") as archive:
-                archive.extractall(path=install_dir)
-            return
-        except Exception as exc:
-            exc_str = str(exc)
-            # Only fall back for unsupported-filter errors; re-raise everything else.
-            if "not supported" not in exc_str and "bcj" not in exc_str.lower():
-                raise InstallError(f"Failed to extract .7z archive: {exc}") from exc
+        PortableInstaller._validate_7z_members(archive_path, dest)
 
         seven_zip = PortableInstaller._find_7zip()
-        if not seven_zip:
-            raise InstallError(
-                "This archive uses a compression filter (BCJ2) that py7zr does not support. "
-                "Install 7-Zip from https://7-zip.org and re-try."
+        if seven_zip:
+            proc = subprocess.run(
+                [seven_zip, "x", str(archive_path), f"-o{dest}", "-y", "-bd"],
+                capture_output=True,
+                text=True,
+                creationflags=_NO_WINDOW,
             )
-        proc = subprocess.run(
-            [seven_zip, "x", str(archive_path), f"-o{install_dir}", "-y"],
-            capture_output=True,
-            text=True,
-        )
-        if proc.returncode != 0:
-            raise InstallError(f"7-Zip extraction failed: {proc.stderr or proc.stdout}")
+            if proc.returncode != 0:
+                raise InstallError(f"7-Zip extraction failed: {(proc.stderr or proc.stdout).strip()}")
+        else:
+            import py7zr
 
-        # Post-extraction validation for the system 7z.exe path — verify nothing escaped.
-        resolved_install = install_dir.resolve()
-        for root, dirs, files in os.walk(install_dir):
+            try:
+                with py7zr.SevenZipFile(archive_path, "r") as archive:
+                    archive.extractall(path=dest)
+            except Exception as exc:
+                exc_str = str(exc)
+                if "not supported" in exc_str or "bcj" in exc_str.lower():
+                    raise InstallError(
+                        "This archive uses a compression filter (BCJ2) that the built-in extractor "
+                        "does not support. Install 7-Zip from https://7-zip.org and try again."
+                    ) from exc
+                raise InstallError(f"Failed to extract .7z archive: {exc}") from exc
+
+        # Post-extraction validation — verify nothing escaped.
+        resolved_dest = dest.resolve()
+        for root, dirs, files in os.walk(dest):
             for name in files + dirs:
                 target = Path(root, name).resolve()
-                if not target.is_relative_to(resolved_install):
+                if not target.is_relative_to(resolved_dest):
                     raise InstallError(
                         f"7z extraction produced a path outside the install directory: {target}"
                     )
 
     @staticmethod
-    def _safe_extract_zip(archive: zipfile.ZipFile, install_dir: Path) -> None:
-        """Extract a ZIP archive, rejecting entries that would escape install_dir (Zip Slip).
-
-        Extraction happens into a temporary directory first.  After all
-        members are extracted and every resolved path is validated, the
-        contents are moved into *install_dir*.  This eliminates the TOCTOU
-        window between the path check and the actual file write.
-
-        Symlink entries are skipped rather than extracted.
-        """
-        import tempfile
-
-        # Extract into a staging directory next to install_dir (same volume
-        # so os.rename / shutil.move is fast).
-        staging = Path(tempfile.mkdtemp(
-            dir=str(install_dir.parent),
-            prefix=".ppm_extract_",
-        ))
-        try:
-            resolved_staging = staging.resolve()
-            for member in archive.infolist():
-                # Skip symlinks — external_attr high 16 bits encode Unix mode;
-                # 0o120000 (0xA000) is the symlink flag.
-                unix_mode = (member.external_attr >> 16) & 0xFFFF
-                if unix_mode and (unix_mode & 0o170000) == 0o120000:
-                    continue
-                target = (staging / member.filename).resolve()
-                if target != resolved_staging and not target.is_relative_to(resolved_staging):
-                    raise InstallError(
-                        f"ZIP extraction aborted: entry {member.filename!r} would escape the install directory."
-                    )
-                archive.extract(member, staging)
-
-            # Post-extraction validation: verify all resolved paths are still
-            # inside the staging directory (catches symlink-based attacks that
-            # could have been created during extraction).
-            for root, dirs, files in os.walk(staging):
-                for name in files + dirs:
-                    resolved = Path(root, name).resolve()
-                    if not resolved.is_relative_to(resolved_staging):
-                        raise InstallError(
-                            f"ZIP extraction aborted: extracted path {resolved} escapes the staging directory."
-                        )
-
-            # Move contents from staging into install_dir.
-            for item in staging.iterdir():
-                dest = install_dir / item.name
-                if dest.exists():
-                    if dest.is_dir():
-                        shutil.rmtree(dest)
-                    else:
-                        dest.unlink()
-                shutil.move(str(item), str(dest))
-        finally:
-            # Clean up staging directory.
-            shutil.rmtree(staging, ignore_errors=True)
-
-    @staticmethod
-    def _flatten_single_subdir(install_dir: Path) -> None:
-        """If extraction produced exactly one subdirectory and no loose files, move
-        its contents up into install_dir and remove the now-empty wrapper folder.
-
-        This handles the common GitHub release ZIP pattern where everything lives
-        inside a versioned top-level folder (e.g. ``AppName-v1.2.3/``).
-        """
-        entries = list(install_dir.iterdir())
-        if len(entries) != 1 or not entries[0].is_dir():
-            return
-        sub = entries[0]
-        for item in list(sub.iterdir()):
-            dest = install_dir / item.name
-            # On collision, remove the existing target so the archive content wins.
-            if dest.exists():
-                if dest.is_dir():
-                    shutil.rmtree(dest)
-                else:
-                    dest.unlink()
-            shutil.move(str(item), str(dest))
-        try:
-            sub.rmdir()
-        except OSError:
-            # Should not happen now, but leave as safety net.
-            shutil.rmtree(sub, ignore_errors=True)
-
-    @staticmethod
-    def run_program(program: ManagedProgram) -> None:
-        if not program.launch_path:
-            raise InstallError("This managed program does not have a launch path yet.")
-
-        launch = Path(program.launch_path)
-        if not launch.is_file():
-            raise InstallError(f"Launch path does not exist: {program.launch_path}")
-
-        cwd = program.working_directory_override or program.install_dir
-        if not Path(cwd).is_dir():
-            cwd = program.install_dir  # fall back to install dir if override is invalid
-
-        suffix = launch.suffix.lower()
-        extra_args = shlex.split(program.launch_args, posix=(platform.system() != "Windows")) if program.launch_args.strip() else []
-
-        try:
-            if program.run_as_admin:
-                # ShellExecuteW passes params through the shell, so we must
-                # quote each argument individually to prevent injection via
-                # shell metacharacters (e.g. & | < > ^).
-                params = _quote_args_for_shell(extra_args) if extra_args else None
-                result = ctypes.windll.shell32.ShellExecuteW(None, "runas", program.launch_path, params, cwd, 1)
-                if result <= 32:
-                    if result == 5:
-                        raise InstallError("Launch cancelled: administrator access was denied or the UAC prompt was dismissed.")
-                    raise InstallError(f"Failed to launch as administrator (ShellExecute returned {result}).")
-                return
-
-            if suffix in {".bat", ".cmd"}:
-                # CreateProcess cannot run batch files directly — cmd /c is required.
-                subprocess.Popen(["cmd", "/c", program.launch_path] + extra_args, cwd=cwd, shell=False)
-            elif suffix == ".ps1":
-                subprocess.Popen(
-                    ["powershell", "-ExecutionPolicy", "RemoteSigned", "-File", program.launch_path] + extra_args,
-                    cwd=cwd,
-                    shell=False,
+    def _safe_extract_zip(archive: zipfile.ZipFile, dest: Path) -> None:
+        """Extract a ZIP archive into *dest* (a fresh staging folder), rejecting
+        entries that would escape it (Zip Slip). Symlink entries are skipped."""
+        resolved_dest = dest.resolve()
+        for member in archive.infolist():
+            # Skip symlinks — external_attr high 16 bits encode Unix mode;
+            # 0o120000 (0xA000) is the symlink flag.
+            unix_mode = (member.external_attr >> 16) & 0xFFFF
+            if unix_mode and (unix_mode & 0o170000) == 0o120000:
+                continue
+            target = (dest / member.filename).resolve()
+            if target != resolved_dest and not target.is_relative_to(resolved_dest):
+                raise InstallError(
+                    f"ZIP extraction aborted: entry {member.filename!r} would escape the install directory."
                 )
-            else:
-                subprocess.Popen([program.launch_path] + extra_args, cwd=cwd, shell=False)
-        except FileNotFoundError:
-            raise InstallError(f"Could not find executable: {program.launch_path}")
-        except OSError as exc:
-            raise InstallError(f"Failed to launch program: {exc}")
+            archive.extract(member, dest)
+
+        # Post-extraction validation: verify all resolved paths are still inside *dest*.
+        for root, dirs, files in os.walk(dest):
+            for name in files + dirs:
+                resolved = Path(root, name).resolve()
+                if not resolved.is_relative_to(resolved_dest):
+                    raise InstallError(
+                        f"ZIP extraction aborted: extracted path {resolved} escapes the install directory."
+                    )
 
     @staticmethod
     def _safe_name(value: str) -> str:
@@ -683,3 +639,12 @@ class PortableInstaller:
             suffix = Path(name).suffix
             name = name[: 200 - len(suffix)] + suffix
         return name
+
+
+def normalize_dir(path: Path | str) -> str:
+    """Key used to compare install folders (absolute, case-insensitive on Windows)."""
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _format_mb(num_bytes: int) -> str:
+    return f"{num_bytes / (1024 * 1024):.1f} MB"

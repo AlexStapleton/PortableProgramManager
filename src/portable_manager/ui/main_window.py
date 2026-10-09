@@ -37,12 +37,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..controller import AppController, InstallOutcome
+from ..controller import AppController, InstallOutcome, RemoveOutcome
 from ..github_client import GitHubRepo
-from ..installer import InstallError
 from ..models import ManagedProgram
 from .edit_program_dialog import EditProgramDialog
-from .icons import make_tray_icon, make_window_icon
+from .icons import make_tray_icon
 from .settings_dialog import SettingsDialog
 from .workers import TaskRunner, TaskWorker
 
@@ -73,6 +72,9 @@ _WINDOWS_POSITIVE_TERMS = frozenset({
 })
 
 
+log = logging.getLogger(__name__)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, controller: AppController) -> None:
         super().__init__()
@@ -85,7 +87,6 @@ class MainWindow(QMainWindow):
         self._workers: list[TaskWorker] = []  # Keep workers alive until Qt is done with them
 
         self.setWindowTitle("Portable Program Manager")
-        self.setWindowIcon(make_window_icon())
         self.resize(1400, 900)
         self._quitting = False          # set True before QApplication.quit() to bypass close-to-tray
         self._tray_notified = False     # show balloon notification only on first tray hide
@@ -108,6 +109,8 @@ class MainWindow(QMainWindow):
         # Defer missing-folder check so the window appears immediately.
         self._set_status("Ready.")
         QTimer.singleShot(0, self._check_missing_folders)
+        # Remove staging/backup/trash folders left behind by an interrupted operation.
+        QTimer.singleShot(3000, self._cleanup_stale_folders)
 
         self._check_timer = QTimer(self)
         if self.controller.settings.run_update_check_on_startup:
@@ -116,6 +119,15 @@ class MainWindow(QMainWindow):
             self._check_timer.setInterval(30 * 60 * 1000)
             self._check_timer.timeout.connect(self._check_due_updates_periodic)
             self._check_timer.start()
+
+    def _cleanup_stale_folders(self) -> None:
+        self._start_task(
+            self.controller.cleanup_stale_temp_dirs,
+            start_message="Tidying up temporary folders...",
+            on_result=lambda _count: None,
+            error_prefix="Cleanup failed",
+            silent_errors=True,
+        )
 
     def _check_missing_folders(self) -> None:
         """Check for missing install folders after the UI is visible.
@@ -603,12 +615,16 @@ class MainWindow(QMainWindow):
             self._warn("Select a managed program first.")
             return
 
-        try:
-            self.controller.run_program(program.program_id)
-        except Exception as exc:
-            self._warn(f"Run failed: {exc}")
-            return
+        self._start_task(
+            self.controller.run_program,
+            program.program_id,
+            start_message=f"Starting {program.name}...",
+            on_result=self._on_program_started,
+            error_prefix=f"Couldn't start {program.name}",
+            lock_widgets=[self.run_button],
+        )
 
+    def _on_program_started(self, program: ManagedProgram) -> None:
         self._set_status(f"Started {program.name}.")
         self._refresh_programs_table()
 
@@ -702,7 +718,10 @@ class MainWindow(QMainWindow):
         msg = QMessageBox(self)
         msg.setWindowTitle("Remove from manager")
         msg.setText(f"Remove <b>{program.name}</b> from the manager?")
-        msg.setInformativeText(f"Install folder: {program.install_dir}")
+        msg.setInformativeText(
+            f"Install folder: {program.install_dir}\n\n"
+            "Deleting files requires the program to be closed first."
+        )
         remove_btn = msg.addButton("Remove only", QMessageBox.ActionRole)
         delete_btn = msg.addButton("Remove and delete files", QMessageBox.DestructiveRole)
         msg.addButton(QMessageBox.Cancel)
@@ -717,18 +736,24 @@ class MainWindow(QMainWindow):
         else:
             return
 
-        try:
-            self.controller.remove_program(program.program_id, delete_files=delete_files)
-        except Exception as exc:
-            self._warn(f"Remove failed: {exc}")
-            return
+        self._start_task(
+            self.controller.remove_program,
+            program.program_id,
+            delete_files,
+            start_message=f"Removing {program.name}...",
+            on_result=self._on_program_removed,
+            error_prefix="Remove failed",
+            lock_widgets=[self.remove_button, self.run_button, self.install_update_button],
+        )
 
+    def _on_program_removed(self, outcome: RemoveOutcome) -> None:
         self._refresh_programs_table()
-        self.program_details.clear()
-        if delete_files:
-            self._set_status(f"Removed {program.name} and deleted its install folder.")
+        if outcome.deleted_files:
+            self._set_status(f"Removed {outcome.program_name} and deleted its install folder.")
         else:
-            self._set_status(f"Removed {program.name} from manager.")
+            self._set_status(f"Removed {outcome.program_name} from manager.")
+        for warning in outcome.warnings:
+            self._warn(warning)
 
     def _open_selected_program_folder(self) -> None:
         program = self._get_selected_program()
@@ -926,26 +951,32 @@ class MainWindow(QMainWindow):
         on_result: Any,
         error_prefix: str,
         lock_widgets: list[QWidget] | None = None,
+        silent_errors: bool = False,
     ) -> None:
         worker = TaskWorker(fn, *args)
         # Keep a Python reference so the GC cannot collect worker/worker.signals
         # while Qt's thread pool still holds the C++ QRunnable pointer.
         self._workers.append(worker)
         locked = lock_widgets or []
-        worker.signals.started.connect(partial(self._on_task_started, start_message, locked))
-        worker.signals.progress.connect(self._on_task_progress)
-        worker.signals.result.connect(on_result)
-        worker.signals.error.connect(partial(self._on_task_error, error_prefix))
-        worker.signals.finished.connect(partial(self._on_task_finished, locked, worker))
-        self.runner.start(worker)
-
-    def _on_task_started(self, message: str, lock_widgets: list[QWidget]) -> None:
+        # Disable the triggering widgets immediately, so a fast double-click
+        # can't queue the same job twice before the worker starts.
+        for widget in locked:
+            widget.setEnabled(False)
         self._active_jobs += 1
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self._set_status(message)
-        for widget in lock_widgets:
-            widget.setEnabled(False)
+        self._set_status(start_message)
+        worker.signals.progress.connect(self._on_task_progress)
+        worker.signals.result.connect(on_result)
+        if silent_errors:
+            worker.signals.error.connect(partial(self._log_task_error, error_prefix))
+        else:
+            worker.signals.error.connect(partial(self._on_task_error, error_prefix))
+        worker.signals.finished.connect(partial(self._on_task_finished, locked, worker))
+        self.runner.start(worker)
+
+    def _log_task_error(self, prefix: str, error_message: str) -> None:
+        log.warning("%s: %s", prefix, error_message)
 
     def _on_task_progress(self, value: int, message: str) -> None:
         self.progress_bar.setVisible(True)
@@ -953,7 +984,8 @@ class MainWindow(QMainWindow):
         self._set_status(message)
 
     def _on_task_error(self, prefix: str, error_message: str) -> None:
-        self._warn(f"{prefix}: {error_message}")
+        log.warning("%s: %s", prefix, error_message)
+        self._warn(f"{prefix}:\n\n{error_message}")
 
     def _on_task_finished(self, lock_widgets: list[QWidget], worker: TaskWorker) -> None:
         try:
@@ -1032,11 +1064,32 @@ class MainWindow(QMainWindow):
                 4000,
             )
 
+    def _confirm_quit_with_active_jobs(self) -> bool:
+        """Ask before quitting while an install/update/remove is still running."""
+        if self._active_jobs == 0:
+            return True
+        reply = QMessageBox.question(
+            self,
+            "Quit Portable Program Manager",
+            "A task is still running (for example an install or update). Quitting now can "
+            "leave it unfinished.\n\nQuit anyway?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+
     def _quit_app(self) -> None:
         """Cleanly quit the application from the tray menu."""
+        if not self._confirm_quit_with_active_jobs():
+            return
         self._quitting = True
+        self._check_timer.stop()
         self._tray_icon.hide()
         QApplication.instance().quit()
+
+    @staticmethod
+    def _tray_available() -> bool:
+        return QSystemTrayIcon.isSystemTrayAvailable()
 
     # ------------------------------------------------------------------
     # Window event overrides
@@ -1049,21 +1102,29 @@ class MainWindow(QMainWindow):
             event.type() == QEvent.Type.WindowStateChange
             and self.isMinimized()
             and self.controller.settings.minimize_to_tray
+            and self._tray_available()
         ):
             # Defer the hide so Qt finishes processing the state change first.
             QTimer.singleShot(0, self._hide_to_tray)
 
     def closeEvent(self, event: QEvent) -> None:
         """Send to tray on close unless the user explicitly chose Quit."""
-        if not self._quitting and self.controller.settings.close_to_tray:
+        if not self._quitting and self.controller.settings.close_to_tray and self._tray_available():
             event.ignore()
             self._hide_to_tray()
-        else:
-            # Stop the periodic timer before tearing down the window so no
-            # callbacks fire after widgets have been destroyed.
-            self._check_timer.stop()
-            self._tray_icon.hide()
-            event.accept()
+            return
+        if not self._quitting and not self._confirm_quit_with_active_jobs():
+            event.ignore()
+            return
+        # Stop the periodic timer before tearing down the window so no
+        # callbacks fire after widgets have been destroyed.
+        self._quitting = True
+        self._check_timer.stop()
+        self._tray_icon.hide()
+        event.accept()
+        # The app keeps running with no windows (quitOnLastWindowClosed is off
+        # for tray mode), so quit explicitly; otherwise an invisible process lingers.
+        QApplication.instance().quit()
 
     # ------------------------------------------------------------------
     # Misc helpers
