@@ -13,6 +13,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 log = logging.getLogger(__name__)
 
 _ACTIVATE_LINE = b"activate"
+_ACK_LINE = b"ok"
 
 
 class SingleInstance(QObject):
@@ -39,6 +40,10 @@ class SingleInstance(QObject):
             probe.write(_ACTIVATE_LINE + b"\n")
             probe.flush()
             probe.waitForBytesWritten(500)
+            # Wait for the running copy to confirm it read the request; disconnecting
+            # straight away could drop the message before the server accepts the pipe.
+            if not (probe.waitForReadyRead(3000) and _ACK_LINE in bytes(probe.readAll())):
+                log.info("The running instance didn't confirm the activation request")
             probe.disconnectFromServer()
             return False
 
@@ -96,6 +101,9 @@ class SingleInstance(QObject):
         self._buffers[conn] = rest
         for line in lines:
             if line.strip() == _ACTIVATE_LINE:
+                if conn.state() == QLocalSocket.LocalSocketState.ConnectedState:
+                    conn.write(_ACK_LINE + b"\n")
+                    conn.flush()
                 self.activation_requested.emit()
 
     def _on_disconnected(self, conn: QLocalSocket) -> None:

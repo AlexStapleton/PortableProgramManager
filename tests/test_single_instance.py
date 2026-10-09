@@ -69,7 +69,9 @@ def test_second_launch_emits_activation_on_primary(qapp, key, instances):
     )
     assert _pump_until(lambda: client.poll() is not None, timeout=20)
     assert client.stdout.read().strip() == "False"
-    assert _pump_until(lambda: bool(received))
+    # The client only exits after the primary acknowledged, so the signal has fired;
+    # the generous timeout is for slow CI machines.
+    assert _pump_until(lambda: bool(received), timeout=15)
 
 
 def test_release_allows_reacquire(qapp, key, instances):
