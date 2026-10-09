@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..controller import AppController, InstallOutcome, RemoveOutcome
+from ..controller import AppController, InstallOutcome, RemoveOutcome, UpdateCheckReport
 from ..github_client import GitHubRepo
 from ..models import ManagedProgram
 from .edit_program_dialog import EditProgramDialog
@@ -111,6 +111,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._check_missing_folders)
         # Remove staging/backup/trash folders left behind by an interrupted operation.
         QTimer.singleShot(3000, self._cleanup_stale_folders)
+        QTimer.singleShot(1500, self._scan_permission_problems)
 
         self._check_timer = QTimer(self)
         if self.controller.settings.run_update_check_on_startup:
@@ -119,6 +120,47 @@ class MainWindow(QMainWindow):
             self._check_timer.setInterval(30 * 60 * 1000)
             self._check_timer.timeout.connect(self._check_due_updates_periodic)
             self._check_timer.start()
+
+    def _repair_selected_program(self) -> None:
+        program = self._get_selected_program()
+        if not program:
+            self._warn("Select a managed program first.")
+            return
+        self._start_task(
+            self.controller.repair_permissions,
+            program.program_id,
+            start_message=f"Repairing permissions for {program.name}...",
+            on_result=lambda p: self._set_status(f"Permissions repaired for {p.name}."),
+            error_prefix="Repair failed",
+            lock_widgets=[self.repair_button],
+        )
+
+    def _scan_permission_problems(self) -> None:
+        self._start_task(
+            self.controller.find_permission_problems,
+            start_message="Checking program folders...",
+            on_result=self._on_permission_scan,
+            error_prefix="Permission check failed",
+            silent_errors=True,
+        )
+
+    def _on_permission_scan(self, problems: dict) -> None:
+        if not problems:
+            return
+        names = []
+        for program_id in problems:
+            try:
+                names.append(self.controller.get_program(program_id).name)
+            except KeyError:
+                pass
+        if not names:
+            return
+        log.warning("Programs with permission problems: %s", problems)
+        self._warn(
+            "Your Windows account can't open some files of: " + ", ".join(names) + ".\n\n"
+            "This comes from installs made by an older version of this app. Select the program "
+            "and click \"Repair Permissions\" to fix it."
+        )
 
     def _cleanup_stale_folders(self) -> None:
         self._start_task(
@@ -357,6 +399,12 @@ class MainWindow(QMainWindow):
         self.install_update_button.clicked.connect(self._install_selected_program_update)
         self.remove_button = QPushButton("Remove From Manager")
         self.remove_button.clicked.connect(self._remove_selected_program)
+        self.repair_button = QPushButton("Repair Permissions")
+        self.repair_button.setToolTip(
+            "Give your Windows account normal access to this program's files again\n"
+            "(fixes installs made by older versions; may ask for administrator approval)."
+        )
+        self.repair_button.clicked.connect(self._repair_selected_program)
         for widget in [
             self.run_button,
             self.open_folder_button,
@@ -365,6 +413,7 @@ class MainWindow(QMainWindow):
             self.check_all_updates_button,
             self.install_update_button,
             self.remove_button,
+            self.repair_button,
         ]:
             actions.addWidget(widget)
         actions.addStretch(1)
@@ -426,6 +475,10 @@ class MainWindow(QMainWindow):
 
     def _on_release_dates_fetched(self, repos: list[GitHubRepo]) -> None:
         """Update the search results table after release dates have been fetched."""
+        # The worker returns enriched copies; ignore them if a newer search replaced the list.
+        if [r.full_name for r in repos] != [r.full_name for r in self.search_results]:
+            return
+        self.search_results = repos
         # Re-apply filters (inactive filter now has release dates to work with).
         visible = self._apply_search_filters(self.search_results)
         self._populate_search_table(visible)
@@ -685,10 +738,46 @@ class MainWindow(QMainWindow):
             lock_widgets=[self.check_updates_button, self.check_all_updates_button, self.install_update_button],
         )
 
-    def _on_bulk_update_check_completed(self, results: list[ManagedProgram]) -> None:
-        available = sum(1 for item in results if item.update_available)
+    def _on_bulk_update_check_completed(self, report: UpdateCheckReport) -> None:
         self._refresh_programs_table()
-        self._set_status(f"Checked {len(results)} programs. {available} update(s) available.")
+        parts = [f"Checked {len(report.checked)} program(s). {report.available_count} update(s) available."]
+        if report.installed:
+            parts.append(f"Installed {len(report.installed)}.")
+        if report.downloaded:
+            parts.append(f"{len(report.downloaded)} downloaded and ready to install.")
+        if report.deferred:
+            parts.append(f"{len(report.deferred)} postponed (program running).")
+        if report.errors:
+            parts.append(f"{len(report.errors)} check(s) failed; see each program's details.")
+        self._set_status(" ".join(parts))
+        for message in report.errors:
+            log.info("Update check problem: %s", message)
+        self._notify_update_report(report)
+
+    def _notify_update_report(self, report: UpdateCheckReport) -> None:
+        """Tray notifications for what the update modes did (manual mode stays silent)."""
+        if not self.controller.settings.show_system_notifications or not self._tray_available():
+            return
+        lines: list[str] = []
+        installed_ids = {p.program_id for p in report.installed}
+        downloaded_ids = {p.program_id for p in report.downloaded}
+        for program in report.installed:
+            lines.append(f"Updated {program.name} to {program.version or 'the latest version'}.")
+        for program in report.downloaded:
+            lines.append(f"{program.name} {program.pending_update_version or ''} is downloaded and ready to install.".replace("  ", " "))
+        for program in report.newly_available:
+            if program.program_id in installed_ids or program.program_id in downloaded_ids:
+                continue
+            policy = program.update_policy
+            if policy.update_mode == "manual" or not policy.notify_on_available_update:
+                continue
+            lines.append(f"{program.name} {program.latest_upstream_version or ''} is available.".replace("  ", " "))
+        lines.extend(report.deferred)
+        if not lines:
+            return
+        title = "Program updates" if len(lines) > 1 else "Program update"
+        shown = lines[:4] + ([f"…and {len(lines) - 4} more"] if len(lines) > 4 else [])
+        self._tray_icon.showMessage(title, "\n".join(shown), QSystemTrayIcon.MessageIcon.Information, 8000)
 
     def _install_selected_program_update(self) -> None:
         program = self._get_selected_program()

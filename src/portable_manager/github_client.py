@@ -1,20 +1,47 @@
 from __future__ import annotations
 
+import math
 import re
 import time
 from dataclasses import dataclass
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse, urlsplit
 
 import requests
+
+from . import __version__
 
 API_ROOT = "https://api.github.com"
 DEFAULT_TIMEOUT = 30
 MAX_RETRIES = 3
-USER_AGENT = "PortableProgramManager/0.8"
-REPO_URL_RE = re.compile(r"https?://github\.com/([^/]+)/([^/#?]+)")
+# Longest single sleep allowed before retrying a rate-limited request.
+MAX_RATE_LIMIT_WAIT = 10
+# Wait assumed when GitHub reports a rate limit without any reset information.
+_UNKNOWN_RESET_WAIT = 60
+USER_AGENT = f"PortableProgramManager/{__version__}"
 # Validates that a full_name looks like "owner/repo" with safe characters only.
 _REPO_FULL_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
+_GITHUB_HOSTS = {"github.com", "www.github.com"}
+# First path segments on github.com that are site pages, never repository owners.
+_RESERVED_OWNERS = {
+    "orgs", "settings", "marketplace", "topics", "search",
+    "features", "sponsors", "apps", "login", "about",
+}
+# Second path segments (after owner/repo) that point at a file, not at the repo page.
+_FILE_PATH_SEGMENTS = {"blob", "raw", "archive"}
+_SHA256_PREFIX = "sha256:"
+
+
+class GitHubError(requests.RequestException):
+    """A GitHub API failure with a message that is safe to show to the user."""
+
+
+class RateLimitError(GitHubError):
+    """The GitHub API rate limit is exhausted and the reset is too far away to wait for."""
+
+    def __init__(self, message: str, reset_at: int | None = None, response: requests.Response | None = None) -> None:
+        super().__init__(message, response=response)
+        self.reset_at = reset_at
 
 
 @dataclass
@@ -23,6 +50,7 @@ class GitHubReleaseAsset:
     download_url: str
     size: int
     content_type: str
+    digest: str = ""  # lowercase hex SHA-256 when GitHub provides one, else ""
 
 
 @dataclass
@@ -52,6 +80,59 @@ class GitHubRepo:
     has_windows_release: bool | None = None  # None = not yet checked
 
 
+def _github_path_segments(url: str) -> list[str] | None:
+    """Return the non-empty path segments of a github.com URL, or None for any other host."""
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or (parts.hostname or "") not in _GITHUB_HOSTS:
+        return None
+    return [segment for segment in parts.path.split("/") if segment]
+
+
+def _owner_repo(owner: str, repo: str) -> str | None:
+    """Return ``owner/repo`` if both parts are safe GitHub names, else None."""
+    if owner in (".", "..") or repo in (".", ".."):
+        return None
+    full_name = f"{owner}/{repo}"
+    return full_name if _REPO_FULL_NAME_RE.match(full_name) else None
+
+
+def parse_release_asset_url(url: str) -> tuple[str, str] | None:
+    """Return ``(owner/repo, tag)`` for a ``github.com/{owner}/{repo}/releases/download/{tag}/{file}`` URL.
+
+    The tag is percent-decoded. Returns None for any other URL.
+    """
+    segments = _github_path_segments(url)
+    if not segments or len(segments) < 6:
+        return None
+    if segments[2] != "releases" or segments[3] != "download":
+        return None
+    full_name = _owner_repo(segments[0], segments[1])
+    if full_name is None:
+        return None
+    tag = unquote(segments[4])
+    if not tag:
+        return None
+    return full_name, tag
+
+
+def _sha256_digest(value: object) -> str:
+    """Return the lowercase hex of a ``sha256:<hex>`` digest, or ``""`` for anything else."""
+    if not isinstance(value, str):
+        return ""
+    text = value.strip().lower()
+    if not text.startswith(_SHA256_PREFIX):
+        return ""
+    return text[len(_SHA256_PREFIX):]
+
+
 class GitHubClient:
     def __init__(self, token: str = "") -> None:
         self.session = requests.Session()
@@ -64,6 +145,9 @@ class GitHubClient:
         )
         if token:
             self.session.headers["Authorization"] = f"Bearer {token}"
+        # Core-resource quota as last reported by GitHub (None = not seen yet).
+        self.rate_limit_remaining: int | None = None
+        self.rate_limit_reset_at: int | None = None
 
     def close(self) -> None:
         """Close the underlying HTTP session and release connection pool resources."""
@@ -81,56 +165,73 @@ class GitHubClient:
         except Exception:
             pass
 
-    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
-        """Issue an HTTP request with automatic retry on rate-limit (403/429).
+    def can_afford(self, calls: int) -> bool:
+        """True when the core quota is unknown or has more than *calls* requests left."""
+        return self.rate_limit_remaining is None or self.rate_limit_remaining > calls
 
-        Respects ``Retry-After`` and ``X-RateLimit-Reset`` headers.  Retries up
-        to ``MAX_RETRIES`` times with exponential back-off capped at 60 s.
+    def _record_rate_limit(self, response: requests.Response) -> None:
+        """Remember core rate-limit headers. Search has its own quota and is ignored."""
+        resource = response.headers.get("X-RateLimit-Resource", "")
+        if resource and resource != "core":
+            return
+        remaining = response.headers.get("X-RateLimit-Remaining", "")
+        if remaining.isdigit():
+            self.rate_limit_remaining = int(remaining)
+        reset_at = response.headers.get("X-RateLimit-Reset", "")
+        if reset_at.isdigit():
+            self.rate_limit_reset_at = int(reset_at)
+
+    @staticmethod
+    def _rate_limit_error(response: requests.Response, reset_at: int | None, now: int) -> RateLimitError:
+        seconds = max(0, reset_at - now) if reset_at is not None else _UNKNOWN_RESET_WAIT
+        minutes = max(1, math.ceil(seconds / 60))
+        return RateLimitError(
+            f"GitHub API rate limit reached. Resets in ~{minutes} min. "
+            "Add a GitHub token in Settings to raise the limit.",
+            reset_at=reset_at,
+            response=response,
+        )
+
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Issue an HTTP request, retrying briefly when GitHub rate-limits it.
+
+        A 403 or 429 counts as a rate limit only when ``X-RateLimit-Remaining`` is
+        ``0`` or a ``Retry-After`` header is present. Any other response is returned
+        as-is without retrying. A rate-limited request is retried (up to
+        ``MAX_RETRIES`` times) only when the wait is at most ``MAX_RATE_LIMIT_WAIT``
+        seconds; otherwise ``RateLimitError`` is raised without sleeping.
         """
         kwargs.setdefault("timeout", DEFAULT_TIMEOUT)
-        last_response: requests.Response | None = None
         for attempt in range(MAX_RETRIES + 1):
             response = self.session.request(method, url, **kwargs)
+            self._record_rate_limit(response)
             if response.status_code not in (403, 429):
                 return response
 
-            # Check if this is actually a rate-limit response (vs. a true 403).
-            remaining = response.headers.get("X-RateLimit-Remaining")
-            if response.status_code == 403 and remaining and int(remaining) > 0:
-                return response  # genuine permission error, not rate-limit
+            retry_after = response.headers.get("Retry-After", "")
+            is_rate_limit = retry_after.isdigit() or response.headers.get("X-RateLimit-Remaining") == "0"
+            if not is_rate_limit:
+                return response
 
-            last_response = response
-            if attempt >= MAX_RETRIES:
-                break
-
-            # Determine how long to wait.
-            retry_after = response.headers.get("Retry-After")
-            if retry_after and retry_after.isdigit():
+            now = int(time.time())
+            if retry_after.isdigit():
                 wait = int(retry_after)
+                reset_at = now + wait
             else:
-                reset_at = response.headers.get("X-RateLimit-Reset")
-                if reset_at and reset_at.isdigit():
-                    wait = max(0, int(reset_at) - int(time.time())) + 1
-                else:
-                    wait = 2 ** attempt  # exponential back-off fallback
+                reset_header = response.headers.get("X-RateLimit-Reset", "")
+                reset_at = int(reset_header) if reset_header.isdigit() else None
+                wait = max(0, reset_at - now) + 1 if reset_at is not None else _UNKNOWN_RESET_WAIT
 
-            wait = min(wait, 60)  # cap at 60 s so we don't block forever
+            if wait > MAX_RATE_LIMIT_WAIT or attempt >= MAX_RETRIES:
+                raise self._rate_limit_error(response, reset_at, now)
             time.sleep(wait)
+        raise GitHubError("GitHub API request failed.")  # not reached: the last attempt always returns or raises
 
-        # All retries exhausted — raise with a clear message.
-        if last_response is None:
-            raise requests.ConnectionError("GitHub API request failed: no response received.")
-        remaining = last_response.headers.get("X-RateLimit-Remaining", "?")
-        reset_at = last_response.headers.get("X-RateLimit-Reset", "")
-        reset_msg = ""
-        if reset_at and reset_at.isdigit():
-            minutes = max(1, (int(reset_at) - int(time.time())) // 60)
-            reset_msg = f" Resets in ~{minutes} min."
-        raise requests.HTTPError(
-            f"GitHub API rate limit exceeded (remaining: {remaining}).{reset_msg} "
-            "Set a GitHub token in Settings to increase your rate limit.",
-            response=last_response,
-        )
+    @staticmethod
+    def _raise_for_status(response: requests.Response, what: str) -> None:
+        """Raise a short GitHubError for any HTTP error status (no URL or headers included)."""
+        if response.status_code >= 400:
+            raise GitHubError(f"GitHub returned HTTP {response.status_code} for {what}.")
 
     @staticmethod
     def _parse_json(response: requests.Response) -> dict | list:
@@ -159,7 +260,7 @@ class GitHubClient:
             f"{API_ROOT}/search/repositories",
             params={"q": query, "sort": sort, "order": "desc", "per_page": max(1, min(limit, 50))},
         )
-        response.raise_for_status()
+        self._raise_for_status(response, "repository search")
         data = self._parse_json(response)
         items = data.get("items", []) if isinstance(data, dict) else []
         return [self._repo_from_api(item) for item in items]
@@ -167,7 +268,11 @@ class GitHubClient:
     def get_repo(self, full_name: str) -> GitHubRepo:
         self._validate_full_name(full_name)
         response = self._request("GET", f"{API_ROOT}/repos/{full_name}")
-        response.raise_for_status()
+        if response.status_code == 404:
+            raise GitHubError(
+                f"Repository {full_name} was not found on GitHub. It may be private, renamed or deleted."
+            )
+        self._raise_for_status(response, f"repository {full_name}")
         return self._repo_from_api(self._parse_json(response))
 
     def get_latest_release(self, full_name: str, include_prereleases: bool = False) -> Optional[GitHubRelease]:
@@ -176,7 +281,7 @@ class GitHubClient:
             response = self._request("GET", f"{API_ROOT}/repos/{full_name}/releases")
             if response.status_code == 404:
                 return None
-            response.raise_for_status()
+            self._raise_for_status(response, f"releases of {full_name}")
             releases = self._parse_json(response)
             if not releases or not isinstance(releases, list):
                 return None
@@ -185,7 +290,7 @@ class GitHubClient:
         response = self._request("GET", f"{API_ROOT}/repos/{full_name}/releases/latest")
         if response.status_code == 404:
             return None
-        response.raise_for_status()
+        self._raise_for_status(response, f"latest release of {full_name}")
         return self._release_from_api(self._parse_json(response))
 
     # Asset name patterns that indicate a Windows build.
@@ -226,16 +331,30 @@ class GitHubClient:
         return date
 
     def extract_repo_full_name(self, url: str) -> Optional[str]:
-        match = REPO_URL_RE.match(url.strip())
-        if not match:
+        """Return ``owner/repo`` when *url* is a GitHub repository page, else None.
+
+        Release download links and other file links return None, so they can be
+        installed as direct URLs instead of being treated as the whole repository.
+        """
+        segments = _github_path_segments(url)
+        if not segments or len(segments) < 2:
             return None
-        owner, repo = match.groups()
-        repo = repo.removesuffix(".git")
-        return f"{owner}/{repo}"
+        owner, repo = segments[0], segments[1].removesuffix(".git")
+        if owner.lower() in _RESERVED_OWNERS:
+            return None
+        if len(segments) >= 3 and segments[2] in _FILE_PATH_SEGMENTS:
+            return None
+        if len(segments) >= 4 and segments[2] == "releases" and segments[3] == "download":
+            return None
+        return _owner_repo(owner, repo)
 
     def infer_repo_from_asset_url(self, url: str) -> Optional[str]:
         parsed = urlparse(url)
-        if parsed.netloc not in {"github.com", "objects.githubusercontent.com", "github-releases.githubusercontent.com"}:
+        if parsed.netloc.lower() in _GITHUB_HOSTS:
+            asset = parse_release_asset_url(url)
+            return asset[0] if asset else None
+
+        if parsed.netloc not in {"objects.githubusercontent.com", "github-releases.githubusercontent.com"}:
             return None
 
         path = parsed.path.strip("/")
@@ -278,7 +397,9 @@ class GitHubClient:
                     download_url=asset.get("browser_download_url", ""),
                     size=asset.get("size", 0),
                     content_type=asset.get("content_type", "application/octet-stream"),
+                    digest=_sha256_digest(asset.get("digest")),
                 )
-                for asset in payload.get("assets", [])
+                for asset in payload.get("assets") or []
+                if isinstance(asset, dict)
             ],
         )

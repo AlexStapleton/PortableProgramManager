@@ -195,6 +195,11 @@ class ManagedProgram:
     last_update_status: str = "not_yet_checked"
     last_error_message: Optional[str] = None
     last_error_at: Optional[str] = None
+    # An update downloaded ahead of time ("download only" mode), ready to apply.
+    pending_update_version: Optional[str] = None
+    pending_update_file: Optional[str] = None
+    pending_update_asset_name: Optional[str] = None
+    pending_update_hash: Optional[str] = None
 
     def to_dict(self) -> dict:
         data = asdict(self)

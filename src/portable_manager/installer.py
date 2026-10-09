@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -10,13 +11,13 @@ import uuid
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 from urllib.parse import urlparse
 
 import requests
 
 from . import fsops
-from .errors import InstallError, ProgramInUseError
+from .errors import AlreadyUpToDateError, InstallError, ProgramInUseError
 from .github_client import USER_AGENT, GitHubClient, GitHubRelease, GitHubReleaseAsset
 from .models import AppSettings, ManagedProgram, UpdatePolicy
 
@@ -37,7 +38,32 @@ _WINDOWS_RESERVED_NAMES = frozenset({
     *(f"LPT{i}" for i in range(1, 10)),
 })
 
-_INSTALLER_HINTS = {"setup", "install", "installer", "unins", "update"}
+# Name tokens that mark an executable as a setup/installer (see looks_like_installer).
+_INSTALLER_TOKENS = frozenset({"setup", "installer", "install"})
+_INSTALLER_STEM_RE = re.compile(r"^(setup|install(er)?)[\W_]*$", re.IGNORECASE)
+
+# Files that are never the main program of a portable app (updaters, uninstallers,
+# crash reporters, runtime redistributables...). Matched with search() against the stem.
+_HELPER_STEM_RES = tuple(re.compile(p, re.IGNORECASE) for p in (
+    r"^unins\d*$", r"uninst", r"uninstall", r"^setup", r"install",
+    r"^update(r)?$", r"updater", r"autoupdate", r"crash", r"helper", r"redist",
+    r"vc_?redist", r"dotnet", r"elevat", r"notification", r"squirrel",
+    r"createdump", r"^7za?$", r"^cmd$", r"^vcruntime",
+))
+
+# OS / architecture markers used by pick_portable_asset.
+_NON_WINDOWS_MARKERS = (
+    "macos", "mac-os", "osx", "darwin", "linux", "ubuntu", "debian", "fedora",
+    "freebsd", "android", "-mac-", "-mac.", "_mac_", "_mac.", ".app.",
+    ".dmg", ".deb", ".rpm", ".appimage", ".apk", ".pkg",
+)
+_NON_WINDOWS_IOS_RE = re.compile(r"(?<![a-z0-9])ios-")
+_ARCH_ARM64_RE = re.compile(r"(?<![a-z0-9])(?:arm64|aarch64)(?![0-9])")
+_ARCH_X64_RE = re.compile(r"(?:(?<![a-z0-9])(?:x64|x86[-_]?64|amd64)(?![0-9])|win64)")
+_ARCH_X86_RE = re.compile(r"(?<![a-z0-9])(?:x86(?![-_]?64)|win32|i[3-6]86|ia32)(?![0-9])")
+_WIN_TOKEN_RE = re.compile(r"(?<![a-z])win(?![a-z])|windows")
+_INSTALLER_NAME_RE = re.compile(r"setup|installer|install|(?<![a-z])msi(?![a-z])")
+_VERSION_RE = re.compile(r"\d+(\.\d+)*")
 
 # Keeps console programs we call (7z.exe) from flashing a window in the GUI build.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -76,9 +102,14 @@ class PortableInstaller:
         program_id = f"repo::{repo.full_name.lower()}"
         install_dir = self._choose_install_dir(self._safe_name(repo.name), program_id, taken_dirs)
         fsops.ensure_writable_dir(Path(self.settings.install_root))
-        downloaded_file, downloaded_hash = self._download(asset.download_url, asset.name, progress_callback=progress_callback)
+        downloaded_file, downloaded_hash = self._download(
+            asset.download_url, asset.name, progress_callback=progress_callback,
+            expected_sha256=_expected_sha256(asset),
+        )
         try:
-            launch_path = self._materialize_asset(downloaded_file, install_dir, progress_callback=progress_callback)
+            launch_path = self._materialize_asset(
+                downloaded_file, install_dir, progress_callback=progress_callback, name_hints=[repo.name],
+            )
         finally:
             self._discard_download(downloaded_file)
 
@@ -155,7 +186,9 @@ class PortableInstaller:
         fsops.ensure_writable_dir(Path(self.settings.install_root))
         downloaded_file, downloaded_hash = self._download(url, file_name, progress_callback=progress_callback)
         try:
-            launch_path = self._materialize_asset(downloaded_file, install_dir, progress_callback=progress_callback)
+            launch_path = self._materialize_asset(
+                downloaded_file, install_dir, progress_callback=progress_callback, name_hints=[program_name],
+            )
         finally:
             self._discard_download(downloaded_file)
 
@@ -202,14 +235,29 @@ class PortableInstaller:
         release: GitHubRelease,
         asset: GitHubReleaseAsset,
         progress_callback: ProgressCallback = None,
+        prefetched: tuple[Path, str] | None = None,
     ) -> ManagedProgram:
         """Download *asset* and apply it over *program*'s folder.
 
         *program* should be a snapshot (not the controller's live object); it is
         updated in place and returned so the caller can commit it under its lock.
+        *prefetched* is ``(file, sha256_hex)`` of an already-downloaded copy of
+        *asset* ("download only" mode); the caller owns and deletes that file.
         """
         install_dir = Path(program.install_dir)
-        downloaded_file, downloaded_hash = self._download(asset.download_url, asset.name, progress_callback=progress_callback)
+        if prefetched is not None:
+            downloaded_file, downloaded_hash = prefetched
+            expected = _expected_sha256(asset)
+            if expected and downloaded_hash and expected != downloaded_hash.lower():
+                raise InstallError(
+                    f"The downloaded update for {program.name} no longer matches the release on GitHub. "
+                    "Check for updates again to download it fresh."
+                )
+        else:
+            downloaded_file, downloaded_hash = self._download(
+                asset.download_url, asset.name, progress_callback=progress_callback,
+                expected_sha256=_expected_sha256(asset),
+            )
         try:
             # Verify the download differs from what is already installed.
             # An identical hash may indicate a replayed or stale download.
@@ -219,13 +267,25 @@ class PortableInstaller:
                     "Update download for %s has identical hash to the installed version (%s); skipping.",
                     program.name, new_hash,
                 )
-                raise InstallError(
+                raise AlreadyUpToDateError(
                     "The downloaded update is identical to the currently installed version "
-                    "(same SHA-256 hash). The update was skipped."
+                    "(same SHA-256 hash), so there was nothing to install."
                 )
-            launch_path = self._materialize_asset(downloaded_file, install_dir, progress_callback=progress_callback)
+            name_hints = [
+                hint for hint in (
+                    program.name,
+                    Path(program.launch_path).stem if program.launch_path else "",
+                    program.repo_full_name.split("/")[-1] if program.repo_full_name else "",
+                )
+                if hint
+            ]
+            launch_path = self._materialize_asset(
+                downloaded_file, install_dir, progress_callback=progress_callback,
+                name_hints=name_hints, previous_launch_relpath=_launch_relpath(program),
+            )
         finally:
-            self._discard_download(downloaded_file)
+            if prefetched is None:
+                self._discard_download(downloaded_file)
 
         self._remove_superseded_single_file(program, asset.name, launch_path)
         program.launch_path = str(launch_path) if launch_path else program.launch_path
@@ -283,12 +343,21 @@ class PortableInstaller:
             counter += 1
         return candidate
 
-    def _download(self, url: str, file_name: str, progress_callback: ProgressCallback = None) -> tuple[Path, str]:
+    def _download(
+        self,
+        url: str,
+        file_name: str,
+        progress_callback: ProgressCallback = None,
+        expected_sha256: str = "",
+    ) -> tuple[Path, str]:
         """Download *url* into a fresh folder in the download cache.
 
         Returns ``(path, sha256_hex)``. Every download gets its own folder so two
         concurrent downloads of identically named assets can't collide. Call
         :meth:`_discard_download` when done with the file.
+
+        If *expected_sha256* is given and the download doesn't match it, the
+        download folder is removed and :class:`InstallError` is raised.
         """
         download_dir = Path(self.settings.download_cache) / f"dl_{uuid.uuid4().hex[:12]}"
         download_dir.mkdir(parents=True, exist_ok=True)
@@ -334,6 +403,12 @@ class PortableInstaller:
                 )
             if downloaded == 0:
                 raise InstallError(f"Downloaded file {file_name} is empty (0 bytes).")
+            expected = _normalise_sha256(expected_sha256)
+            if expected and expected != sha256.hexdigest():
+                raise InstallError(
+                    f"Integrity check failed for {file_name}: the download doesn't match the SHA-256 "
+                    "published by GitHub. Nothing was installed."
+                )
         except BaseException:
             # Remove the incomplete file so it doesn't get mistaken for a valid download.
             shutil.rmtree(download_dir, ignore_errors=True)
@@ -353,13 +428,24 @@ class PortableInstaller:
             except OSError:
                 pass  # non-critical — stale cache file is harmless
 
-    def _materialize_asset(self, downloaded_file: Path, install_dir: Path, progress_callback: ProgressCallback = None) -> Path | None:
+    def _materialize_asset(
+        self,
+        downloaded_file: Path,
+        install_dir: Path,
+        progress_callback: ProgressCallback = None,
+        name_hints: Sequence[str] = (),
+        previous_launch_relpath: str | None = None,
+    ) -> Path | None:
         """Unpack/copy *downloaded_file* into *install_dir* and return the launch file.
 
         The new content is prepared in a staging folder next to *install_dir*
         and then applied in one all-or-nothing step (see :mod:`fsops`). The
         launch file is chosen from the *new* content only, so an update can't
         end up pointing at a file left over from the previous version.
+
+        *name_hints* are passed to :meth:`guess_launch_executable`. When
+        *previous_launch_relpath* (the old launch file, relative to *install_dir*)
+        still exists in the new content, that file is used instead of guessing.
         """
         suffix = downloaded_file.suffix.lower()
         if progress_callback:
@@ -384,7 +470,9 @@ class PortableInstaller:
                     raise InstallError(f"The archive {downloaded_file.name} is empty.")
                 if progress_callback:
                     progress_callback(93, f"Extracted {downloaded_file.name}")
-                launch_in_staging = self.guess_launch_executable(staging)
+                launch_in_staging = _previous_launch_in_staging(staging, previous_launch_relpath)
+                if launch_in_staging is None:
+                    launch_in_staging = self.guess_launch_executable(staging, name_hints)
             else:
                 launch_in_staging = staging / downloaded_file.name
 
@@ -398,64 +486,96 @@ class PortableInstaller:
         return install_dir / relative_launch if relative_launch else None
 
     @staticmethod
-    def guess_launch_executable(install_dir: Path) -> Path | None:
-        exe_candidates: list[Path] = []
-        script_candidates: list[Path] = []
+    def guess_launch_executable(install_dir: Path, name_hints: Sequence[str] = ()) -> Path | None:
+        """Pick the file most likely to be the program's main executable.
+
+        Executables come before scripts. Within each group: helpers (updaters,
+        uninstallers, crash reporters...) last, then files whose name matches a
+        hint in *name_hints*, then the shallowest, then the largest file.
+        """
+        candidates: list[Path] = []
         for root, _, files in os.walk(install_dir):
             for file_name in files:
                 path = Path(root) / file_name
                 suffix = path.suffix.lower()
-                if suffix in EXECUTABLE_EXTENSIONS:
-                    exe_candidates.append(path)
-                elif suffix in SCRIPT_EXTENSIONS:
-                    script_candidates.append(path)
+                if suffix in EXECUTABLE_EXTENSIONS or suffix in SCRIPT_EXTENSIONS:
+                    candidates.append(path)
+        if not candidates:
+            return None
+
+        hints = [key for key in (_normalise_name(h) for h in name_hints) if key]
 
         def _sort_key(p: Path) -> tuple:
-            return ("setup" in p.name.lower(), len(p.parts), len(p.name))
+            stem_key = _normalise_name(p.stem)
+            if hints and stem_key in hints:
+                hint_rank = 2
+            elif hints and len(stem_key) >= 3 and any(
+                len(h) >= 3 and (stem_key in h or h in stem_key) for h in hints
+            ):
+                hint_rank = 1
+            else:
+                hint_rank = 0
+            try:
+                size = p.stat().st_size
+            except OSError:
+                size = 0
+            return (
+                p.suffix.lower() in SCRIPT_EXTENSIONS,
+                any(rx.search(p.stem) for rx in _HELPER_STEM_RES),
+                -hint_rank,
+                len(p.relative_to(install_dir).parts),
+                -size,
+                len(p.name),
+            )
 
-        if exe_candidates:
-            exe_candidates.sort(key=_sort_key)
-            return exe_candidates[0]
-        if script_candidates:
-            script_candidates.sort(key=_sort_key)
-            return script_candidates[0]
-        return None
+        return min(candidates, key=_sort_key)
 
     @staticmethod
     def looks_like_installer(launch_path: Path | None, install_dir: Path) -> bool:
         """Return True if the resolved launch executable looks like a setup/installer.
 
-        Heuristics:
-        - The filename contains 'setup', 'install', etc.
-        - The archive produced only one .exe and it matches the pattern.
-        - The asset filename itself contained 'setup' or 'install'.
+        Heuristics, on name *tokens* (so ``Updater`` or ``uninstall`` don't count):
+        - The file name has a token ``setup``, ``installer`` or ``install``
+          (``MyAppSetup`` -> my, app, setup).
+        - The install folder holds only one .exe and its name has such a token.
         """
         if not launch_path:
             return False
-        name_lower = launch_path.stem.lower()
-        if any(hint in name_lower for hint in _INSTALLER_HINTS):
+        if _is_installer_stem(launch_path.stem):
             return True
-        # If there's only one .exe in the entire install dir, and no other
-        # executables, check the asset-level name too.
+        # If there's only one .exe in the entire install dir, check its name too.
         exes = list(install_dir.rglob("*.exe"))
-        if len(exes) == 1:
-            sole_name = exes[0].stem.lower()
-            if any(hint in sole_name for hint in _INSTALLER_HINTS):
-                return True
+        if len(exes) == 1 and _is_installer_stem(exes[0].stem):
+            return True
         return False
 
     @staticmethod
-    def pick_portable_asset(assets: list[GitHubReleaseAsset], asset_name_hint: str | None = None) -> GitHubReleaseAsset | None:
+    def pick_portable_asset(
+        assets: list[GitHubReleaseAsset],
+        asset_name_hint: str | None = None,
+        machine: str | None = None,
+    ) -> GitHubReleaseAsset | None:
+        """Choose the Windows build to install, or None if there isn't one.
+
+        Non-Windows assets are dropped, not just penalised. Architecture is a
+        strong preference: x64 machines get x64 builds, then unmarked, then
+        x86; arm64 machines get arm64, then x64, then unmarked, then x86.
+        *machine* defaults to the running machine (``platform.machine()``).
+        """
         if not assets:
             return None
 
+        machine_key = (machine if machine is not None else platform.machine()).lower()
+        if machine_key in ("arm64", "aarch64"):
+            arch_order = ("arm64", "x64", "", "x86")
+        elif machine_key in ("amd64", "x86_64", "x64"):
+            arch_order = ("x64", "", "x86")
+        else:
+            arch_order = ("x86", "")
+        arch_weight = {arch: (len(arch_order) - idx) * 10_000 for idx, arch in enumerate(arch_order)}
+
         preferred_patterns = [".zip", "portable", "win64", "win-x64", "windows", "x86_64", ".exe"]
-        # Patterns that indicate a non-Windows asset — heavy penalty.
-        non_windows_patterns = [
-            "macos", "darwin", "linux", "ubuntu", "debian", "fedora",
-            "arm64", "aarch64", ".dmg", ".deb", ".rpm", ".appimage",
-            ".app", "-mac-", "-mac.", "_mac_", "_mac.",
-        ]
+        hint_key = _normalise_name_for_hint(asset_name_hint or "")
         hint_lower = (asset_name_hint or "").lower().strip()
         scored: list[tuple[int, GitHubReleaseAsset]] = []
         for asset in assets:
@@ -463,21 +583,28 @@ class PortableInstaller:
             suffix = Path(name).suffix.lower()
             if suffix not in PORTABLE_EXTENSIONS:
                 continue
-            score = 0
+            # Drop builds for other operating systems outright.
+            if any(marker in name for marker in _NON_WINDOWS_MARKERS) or _NON_WINDOWS_IOS_RE.search(name):
+                continue
+            arch = _asset_arch(name)
+            if arch not in arch_weight:
+                continue  # e.g. an arm64-only build on an x64 machine
+
+            score = arch_weight[arch]
             for idx, pattern in enumerate(preferred_patterns[::-1], start=1):
                 if pattern in name:
                     score += idx * 10
-            # Penalise assets that are clearly for another OS.
-            for pattern in non_windows_patterns:
-                if pattern in name:
-                    score -= 500
-                    break
+            if _WIN_TOKEN_RE.search(name):
+                score += 30
             if hint_lower:
                 if name == hint_lower:
                     score += 1000
                 elif hint_lower in name or name in hint_lower:
                     score += 250
-            if "installer" in name or "msi" in name:
+                elif hint_key and hint_key == _normalise_name_for_hint(name):
+                    # Same asset, new version: "tool-1.2-win64.zip" -> "tool-1.3-win64.zip".
+                    score += 500
+            if _INSTALLER_NAME_RE.search(name):
                 score -= 100
             scored.append((score, asset))
 
@@ -644,6 +771,87 @@ class PortableInstaller:
 def normalize_dir(path: Path | str) -> str:
     """Key used to compare install folders (absolute, case-insensitive on Windows)."""
     return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _normalise_name(value: str) -> str:
+    """Lowercase letters and digits only, for comparing program/file names."""
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _normalise_name_for_hint(value: str) -> str:
+    """Like :func:`_normalise_name`, but ignoring version numbers (``tool-1.2`` == ``tool-1.3``)."""
+    return re.sub(r"[^a-z0-9]", "", _VERSION_RE.sub("", value.lower()))
+
+
+def _asset_arch(name_lower: str) -> str:
+    """Classify a lowercase asset name as ``arm64``, ``x64``, ``x86`` or ``""`` (unmarked)."""
+    if _ARCH_ARM64_RE.search(name_lower):
+        return "arm64"
+    if _ARCH_X64_RE.search(name_lower):
+        return "x64"
+    if _ARCH_X86_RE.search(name_lower):
+        return "x86"
+    return ""
+
+
+_CAMEL_LOWER_UPPER_RE = re.compile(r"([a-z0-9])([A-Z])")
+_CAMEL_ACRONYM_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
+
+
+def _name_tokens(name: str) -> list[str]:
+    """Split a file stem into lowercase words: ``MyAppSetup`` -> ``[my, app, setup]``."""
+    spaced = _CAMEL_LOWER_UPPER_RE.sub(r"\1 \2", name)
+    spaced = _CAMEL_ACRONYM_RE.sub(r"\1 \2", spaced)
+    return [token.lower() for token in re.split(r"[^A-Za-z0-9]+", spaced) if token]
+
+
+def _is_installer_stem(stem: str) -> bool:
+    if _INSTALLER_STEM_RE.match(stem):
+        return True
+    if any(token in _INSTALLER_TOKENS for token in _name_tokens(stem)):
+        return True
+    # Glued lowercase names such as "myappsetup" have no token boundary.
+    lowered = stem.lower()
+    return not lowered.startswith("unins") and lowered.endswith(("setup", "installer"))
+
+
+def _expected_sha256(asset: GitHubReleaseAsset) -> str:
+    """The hex SHA-256 GitHub publishes for *asset*, or "" when there isn't one."""
+    digest = str(getattr(asset, "digest", "") or "").strip().lower()
+    algorithm, sep, value = digest.partition(":")
+    if sep:
+        return value.strip() if algorithm == "sha256" else ""
+    # GitHubClient already strips the "sha256:" prefix and stores bare hex.
+    return digest if re.fullmatch(r"[0-9a-f]{64}", digest) else ""
+
+
+def _normalise_sha256(value: str) -> str:
+    value = (value or "").strip().lower()
+    if value.startswith("sha256:"):
+        value = value[len("sha256:"):]
+    return value
+
+
+def _launch_relpath(program: ManagedProgram) -> str | None:
+    """The program's current launch file, relative to its install folder (or None)."""
+    if not program.launch_path or not program.install_dir:
+        return None
+    try:
+        return str(Path(program.launch_path).relative_to(Path(program.install_dir)))
+    except ValueError:
+        return None
+
+
+def _previous_launch_in_staging(staging: Path, relpath: str | None) -> Path | None:
+    """The previous launch file if the new content still ships it at the same place."""
+    if not relpath:
+        return None
+    candidate = staging / relpath
+    if not fsops.is_within(candidate, staging) or not candidate.is_file():
+        return None
+    if candidate.suffix.lower() not in EXECUTABLE_EXTENSIONS | SCRIPT_EXTENSIONS:
+        return None
+    return candidate
 
 
 def _format_mb(num_bytes: int) -> str:

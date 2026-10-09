@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import subprocess
 import stat
 import uuid
 from pathlib import Path
@@ -351,3 +352,98 @@ def cleanup_stale_temp_dirs(root: Path) -> int:
             except OSError:
                 log.info("Stale folder %s is still in use", entry, exc_info=True)
     return removed
+
+
+# ---------------------------------------------------------------------------
+# Permission repair
+# ---------------------------------------------------------------------------
+#
+# Installs made by v0.7 and earlier extracted into tempfile.mkdtemp() folders.
+# Since Python 3.13 those get a protected ACL on Windows (Owner Rights, SYSTEM,
+# Administrators; inheritance blocked), and moved files keep it. When the
+# manager ran elevated, the owner was the Administrators group, so the user's
+# normal account lost access to its own programs. Repair resets every ACL to
+# inherit from the install folder's parent again.
+
+_ERROR_ACCESS_DENIED = 5
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def find_permission_problems(folder: Path, limit: int = 5) -> list[Path]:
+    """Return up to *limit* items under *folder* the current user can't open.
+
+    Only "access denied" counts; files that are merely in use are ignored.
+    """
+    problems: list[Path] = []
+
+    def _denied(exc: OSError) -> bool:
+        return getattr(exc, "winerror", None) == _ERROR_ACCESS_DENIED or (
+            isinstance(exc, PermissionError) and getattr(exc, "winerror", None) is None
+        )
+
+    stack = [folder]
+    while stack and len(problems) < limit:
+        current = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            if _denied(exc):
+                problems.append(Path(current))
+            continue
+        for entry in entries:
+            if len(problems) >= limit:
+                break
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(Path(entry.path))
+                else:
+                    with open(entry.path, "rb"):
+                        pass
+            except OSError as exc:
+                if _denied(exc):
+                    problems.append(Path(entry.path))
+    return problems
+
+
+def _reset_acl_command(folder: Path) -> list[str]:
+    return ["icacls", str(folder), "/reset", "/T", "/C", "/Q"]
+
+
+def repair_permissions(folder: Path, allow_elevation: bool = True) -> bool:
+    """Reset ACLs under *folder* so they inherit normally. Returns True if all items are accessible after.
+
+    Tries without elevation first (enough when the user owns the files). If
+    items remain inaccessible and *allow_elevation* is set, takes ownership
+    and resets again with administrator rights, which shows a UAC prompt.
+    Raises :class:`InstallError` if the user declines the prompt.
+    """
+    if not folder.is_dir():
+        raise InstallError(f"The folder doesn't exist: {folder}")
+    subprocess.run(_reset_acl_command(folder), capture_output=True, text=True, creationflags=_NO_WINDOW)
+    if not find_permission_problems(folder, limit=1):
+        return True
+    if not allow_elevation:
+        return False
+
+    from .winutil import run_elevated_and_wait
+
+    script = (
+        f'/c takeown /F "{folder}" /R /D Y >nul 2>&1 & '
+        f'icacls "{folder}" /setowner "{_current_user()}" /T /C /Q >nul 2>&1 & '
+        f'icacls "{folder}" /reset /T /C /Q >nul 2>&1'
+    )
+    try:
+        run_elevated_and_wait(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe"), script)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1223:
+            raise InstallError("Permission repair cancelled: the administrator (UAC) prompt was declined.") from exc
+        raise InstallError(f"Couldn't run the permission repair: {exc}") from exc
+    return not find_permission_problems(folder, limit=1)
+
+
+def _current_user() -> str:
+    domain = os.environ.get("USERDOMAIN", "")
+    user = os.environ.get("USERNAME", "")
+    return f"{domain}\\{user}" if domain and user else user
