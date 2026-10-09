@@ -84,7 +84,8 @@ class FakeController:
     def close(self) -> None:
         self.github.close()
 
-    def search_github(self, query, sort="stars", include_forks=False, progress_callback=None):
+    def search_github(self, query, sort="stars", include_forks=False, source_id=None, progress_callback=None):
+        self.search_source_calls = getattr(self, "search_source_calls", []) + [source_id]
         self.search_calls.append((query, sort))
         self.include_forks_calls.append(include_forks)
         return list(self.results_by_query.get(query, []))
@@ -93,7 +94,7 @@ class FakeController:
         # Like the real controller: returns enriched copies, never mutates the input.
         return [dataclasses.replace(repo, **self.enrichment.get(repo.full_name, {})) for repo in repos]
 
-    def install_from_repo(self, repo_full_name, channel="latest_release", progress_callback=None):
+    def install_from_repo(self, repo_full_name, channel="latest_release", source_id="github", progress_callback=None):
         self.install_repo_calls.append((repo_full_name, channel))
         return self._outcome(repo_full_name)
 
@@ -106,7 +107,7 @@ class FakeController:
             return self.install_outcome
         return InstallOutcome(program=make_program(key.split("/")[-1], repo=None))
 
-    def find_managed_program(self, repo_full_name=None, url=None):
+    def find_managed_program(self, repo_full_name=None, url=None, source_id="github"):
         return self.installed.get(repo_full_name or url)
 
     def run_program(self, program_id, progress_callback=None):

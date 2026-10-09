@@ -12,7 +12,7 @@ from PySide6.QtGui import QColor, QDesktopServices, QPalette
 from PySide6.QtWidgets import QMessageBox, QTextBrowser
 
 from ..models import ManagedProgram
-from .programs_model import friendly_time, policy_summary, program_status, source_label
+from .programs_model import SOURCE_NAMES, project_page_url, friendly_time, policy_summary, program_status, source_label
 from .theme import status_color
 
 log = logging.getLogger(__name__)
@@ -130,9 +130,11 @@ class ProgramDetailsView(QTextBrowser):
             launch = f'<span style="color:{muted}">Not set. Use Edit to choose the file to launch.</span>'
         rows.append(("Launches", launch))
 
-        if program.repo_full_name:
+        page = project_page_url(program)
+        if program.repo_full_name and page:
             repo = esc(program.repo_full_name)
-            source = f'GitHub · <a href="https://github.com/{repo}" style="color:{accent}">{repo}</a>'
+            site = esc(SOURCE_NAMES.get(program.provider_id, program.provider_id or "GitHub"))
+            source = f'{site} · <a href="{esc(page)}" style="color:{accent}">{repo}</a>'
         else:
             source = esc(source_label(program))
         rows.append(("Source", source))

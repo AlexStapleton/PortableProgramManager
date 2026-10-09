@@ -311,7 +311,7 @@ class DiscoverTab(QWidget):
         heading.setProperty("role", "heading")
         root.addWidget(heading)
 
-        subtitle = QLabel("Search GitHub for portable Windows apps, or install from a link.")
+        subtitle = QLabel("Search GitHub, GitLab, Codeberg and your own sources for portable Windows apps, or install from a link.")
         subtitle.setProperty("role", "subtle")
         root.addWidget(subtitle)
 
@@ -325,7 +325,7 @@ class DiscoverTab(QWidget):
 
         search_row = QHBoxLayout()
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search GitHub — e.g. markdown editor portable")
+        self.search_input.setPlaceholderText("Search — e.g. markdown editor portable")
         self.search_input.setClearButtonEnabled(True)
         self.search_input.returnPressed.connect(self._search)
         self.search_button = QPushButton("Search")
@@ -394,6 +394,15 @@ class DiscoverTab(QWidget):
         )
         self.forks_with_changes_check.toggled.connect(self._on_filter_changed)
         fork_row.addWidget(self.forks_with_changes_check)
+        fork_row.addSpacing(16)
+        fork_row.addWidget(QLabel("Search in"))
+        self.source_combo = QComboBox()
+        self.source_combo.setToolTip(
+            "Which sites to search. Add or change sites in Settings → Sources."
+        )
+        self.reload_sources()
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+        fork_row.addWidget(self.source_combo)
         fork_row.addStretch(1)
         layout.addLayout(fork_row)
 
@@ -518,7 +527,8 @@ class DiscoverTab(QWidget):
             query,
             self.sort_combo.currentData(),
             self.include_forks_check.isChecked(),
-            start_message=f"Searching GitHub for '{query}'...",
+            self.source_combo.currentData(),
+            start_message=f"Searching for '{query}'...",
             on_result=partial(self._on_search_completed, generation, query),
             error_prefix="Search failed",
             lock_widgets=self._locked_widgets(),
@@ -566,6 +576,28 @@ class DiscoverTab(QWidget):
             return
         self._populate(self._visible_after_filters())
         self._report_counts()
+
+    def reload_sources(self) -> None:
+        """Refill "Search in" from the user's sources (call after Settings changes)."""
+        current = self.source_combo.currentData() if self.source_combo.count() else None
+        self.source_combo.blockSignals(True)
+        self.source_combo.clear()
+        self.source_combo.addItem("All my sources", None)
+        settings = getattr(self._controller, "settings", None)
+        for source in getattr(settings, "sources", None) or []:
+            if source.enabled:
+                self.source_combo.addItem(source.name, source.id)
+        index = self.source_combo.findData(current)
+        self.source_combo.setCurrentIndex(max(0, index))
+        self.source_combo.blockSignals(False)
+
+    def _on_source_changed(self, *_: object) -> None:
+        if self.search_input.text().strip():
+            self._search()
+
+    def _source_name(self, source_id: str) -> str:
+        names = getattr(self._controller, "source_names", None)
+        return (names() if callable(names) else {}).get(source_id, source_id)
 
     def _on_include_forks_changed(self, checked: bool) -> None:
         """Forks come from a different GitHub query, so search again."""
@@ -636,6 +668,8 @@ class DiscoverTab(QWidget):
         name.setData(_ID_ROLE, repo.full_name)
         table.setItem(row, COL_NAME, name)
         repo_text, repo_tip = fork_label(repo)
+        if repo.source_id and repo.source_id != "github":
+            repo_text = f"{self._source_name(repo.source_id)} · {repo_text}"
         table.setItem(row, COL_REPO, _cell(repo_text, tooltip=repo_tip))
 
         table.setItem(row, COL_STARS, _cell(
@@ -647,7 +681,7 @@ class DiscoverTab(QWidget):
         table.setItem(row, COL_RELEASE, self._release_cell(repo))
         table.setItem(row, COL_WINDOWS, self._windows_cell(repo))
 
-        installed = self._controller.find_managed_program(repo_full_name=repo.full_name) is not None
+        installed = self._find_installed(repo.full_name, repo.source_id) is not None
         table.setItem(row, COL_INSTALLED, _cell(
             "✓" if installed else "",
             sort_key=1 if installed else 0,
@@ -782,16 +816,23 @@ class DiscoverTab(QWidget):
         if repo is None:
             self._host.warn("Select a search result first.")
             return
-        self._install_repo(repo.full_name)
+        self._install_repo(repo.full_name, repo.source_id or "github")
 
-    def _install_repo(self, repo_full_name: str) -> None:
-        existing = self._controller.find_managed_program(repo_full_name=repo_full_name)
+    def _find_installed(self, repo_full_name: str, source_id: str = "github") -> ManagedProgram | None:
+        try:
+            return self._controller.find_managed_program(repo_full_name=repo_full_name, source_id=source_id)
+        except TypeError:  # controllers without multi-source support
+            return self._controller.find_managed_program(repo_full_name=repo_full_name)
+
+    def _install_repo(self, repo_full_name: str, source_id: str = "github") -> None:
+        existing = self._find_installed(repo_full_name, source_id)
         if existing is not None and not self._confirm_reinstall(existing):
             return
         self._host.start_task(
             self._controller.install_from_repo,
             repo_full_name,
             self.channel_combo.currentData(),
+            source_id,
             start_message=f"Installing {repo_full_name}...",
             on_result=partial(self._on_install_completed, f"Installed from {repo_full_name}"),
             error_prefix="Install failed",
@@ -801,12 +842,17 @@ class DiscoverTab(QWidget):
     def _install_from_link(self) -> None:
         value = self.link_input.text().strip()
         if not value:
-            self._host.warn("Paste a GitHub project link or a direct download link.")
+            self._host.warn("Paste a project link (GitHub, GitLab, Codeberg...) or a direct download link.")
             return
 
-        repo_full_name = self._controller.github.extract_repo_full_name(value)
+        match_url = getattr(self._controller, "match_url", None)
+        if callable(match_url):
+            match = match_url(value)
+            source_id, repo_full_name = match if match else ("github", None)
+        else:
+            source_id, repo_full_name = "github", self._controller.github.extract_repo_full_name(value)
         if repo_full_name:
-            self._install_repo(repo_full_name)
+            self._install_repo(repo_full_name, source_id)
             return
 
         existing = self._controller.find_managed_program(url=value)

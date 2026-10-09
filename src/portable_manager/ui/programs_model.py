@@ -89,9 +89,25 @@ def friendly_time(value: str | None, now: datetime | None = None) -> str:
     return exact if relative is None else f"{relative} ({exact})"
 
 
+# Display names for sources, set by the Programs tab from the user's settings.
+SOURCE_NAMES: dict[str, str] = {"github": "GitHub", "gitlab": "GitLab", "codeberg": "Codeberg"}
+SOURCE_BASE_URLS: dict[str, str] = {
+    "github": "https://github.com", "gitlab": "https://gitlab.com", "codeberg": "https://codeberg.org",
+}
+
+
+def project_page_url(program: ManagedProgram) -> str | None:
+    """The project's page on the site it was installed from (GitHub, GitLab, Codeberg...)."""
+    if not program.repo_full_name:
+        return None
+    base = SOURCE_BASE_URLS.get(program.provider_id or "github")
+    return f"{base}/{program.repo_full_name}" if base else None
+
+
 def source_label(program: ManagedProgram) -> str:
     if program.source_type == "github_repo":
-        return f"GitHub · {program.repo_full_name or program.source_value}"
+        site = SOURCE_NAMES.get(program.provider_id, program.provider_id or "GitHub")
+        return f"{site} · {program.repo_full_name or program.source_value}"
     if program.source_type == "direct_url":
         host = urlparse(program.source_value or "").hostname or program.source_value
         return f"Direct download · {host}"
