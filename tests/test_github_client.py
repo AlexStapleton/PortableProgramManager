@@ -498,3 +498,16 @@ def test_compare_fork_with_parent(monkeypatch):
     monkeypatch.setattr(client.session, "request", fake_request)
     assert client.compare_fork_with_parent("AlexStapleton/SMUDebugTool") == ("irusanov/SMUDebugTool", 124, 4)
     assert urls[1].endswith("/repos/irusanov/SMUDebugTool/compare/master...AlexStapleton:SMUDebugTool:master")
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("app-win64.zip", True), ("App_Windows_x64.zip", True), ("tool-win.zip", True),
+        ("setup.exe", True), ("tool-x86_64-pc-windows-msvc.zip", True), ("App.msi", True),
+        ("release-cli-darwin-amd64.tar.gz", False), ("twinkle-linux.tar.gz", False),
+        ("app-macos.dmg", False),
+    ],
+)
+def test_windows_asset_detection(name, expected):
+    assert bool(GitHubClient._WIN_ASSET_RE.search(name)) is expected

@@ -41,6 +41,7 @@ from ..models import ManagedProgram
 from .details_view import ProgramDetailsView
 from .edit_program_dialog import EditProgramDialog
 from .host import TaskHost
+from . import programs_model
 from .programs_model import LAST_RUN, NAME, SOURCE, STATUS, VERSION, ProgramsFilterProxy, ProgramsModel
 
 log = logging.getLogger(__name__)
@@ -103,8 +104,9 @@ def _has_update(program: ManagedProgram) -> bool:
 
 
 def _project_url(program: ManagedProgram) -> str | None:
-    if program.repo_full_name:
-        return f"https://github.com/{program.repo_full_name}"
+    page = programs_model.project_page_url(program)
+    if page:
+        return page
     if program.source_type != "direct_url" and program.homepage_url:
         if program.homepage_url.startswith(("http://", "https://")):
             return program.homepage_url
@@ -358,6 +360,12 @@ class ProgramsTab(QWidget):
         """Reload every program from the controller, keeping the selection."""
         programs = self._controller.list_programs()
         selected = self.selected_program_id()
+        names = getattr(self._controller, "source_names", None)
+        if callable(names):
+            programs_model.SOURCE_NAMES.update(names())
+        settings = getattr(self._controller, "settings", None)
+        for source in getattr(settings, "sources", None) or []:
+            programs_model.SOURCE_BASE_URLS[source.id] = source.base_url
         self._model.set_programs(programs)
         self._stack.setCurrentIndex(0 if programs else 1)
         self._toolbar.setVisible(bool(programs))

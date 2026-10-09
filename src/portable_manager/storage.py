@@ -55,13 +55,22 @@ class Storage:
             payload = json.loads(self.settings_path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("settings file does not contain a JSON object")
-            # Decrypt the GitHub token (handles both DPAPI-encrypted and legacy plaintext).
+            # Decrypt tokens (handles both DPAPI-encrypted and legacy plaintext values).
+            stored_tokens = []
             token = payload.get("github_token")
+            stored_tokens.append(token)
             payload["github_token"] = decrypt_token(token) if isinstance(token, str) and token else ""
+            for source in payload.get("sources") or []:
+                if isinstance(source, dict):
+                    stored_tokens.append(source.get("token"))
+                    raw = source.get("token")
+                    source["token"] = decrypt_token(raw) if isinstance(raw, str) and raw else ""
             settings = AppSettings.from_dict(payload)
-            if isinstance(token, str) and token and not is_encrypted_token(token):
-                # Written before tokens were encrypted: re-save so it's protected at rest.
-                log.info("Encrypting a GitHub token that was stored in plain text")
+            if any(isinstance(t, str) and t and not is_encrypted_token(t) for t in stored_tokens) \
+                    or "sources" not in payload:
+                # Plain-text token from an older version, or settings from before
+                # Sources existed: re-save so tokens are protected at rest.
+                log.info("Upgrading settings file (encrypting tokens / adding sources)")
                 self.save_settings(settings)
             return settings
         except (KeyError, TypeError, ValueError) as exc:
@@ -84,9 +93,16 @@ class Storage:
         except OSError:
             pass
         data = settings.to_dict()
-        # Encrypt the GitHub token before writing to disk.
-        if data.get("github_token"):
-            data["github_token"] = encrypt_token(data["github_token"])
+        # The GitHub token now lives on the "github" source; don't keep a second copy.
+        # (A token set only on the legacy field, e.g. by older code, is moved over.)
+        for source in data.get("sources", []):
+            if source.get("id") == "github" and not source.get("token") and data.get("github_token"):
+                source["token"] = data["github_token"]
+        data["github_token"] = ""
+        # Encrypt every source token before writing to disk.
+        for source in data.get("sources", []):
+            if source.get("token"):
+                source["token"] = encrypt_token(source["token"])
         self._atomic_write(self.settings_path, json.dumps(data, indent=2))
 
     def load_programs(self) -> List[ManagedProgram]:

@@ -5,8 +5,10 @@ Install and manage portable .exe programs.
 Portable Program Manager is a Windows 10/11 desktop app (Python + PySide6). It finds portable apps on GitHub, installs them from a GitHub project or a direct download link, keeps them up to date, and launches them from one place or from the system tray.
 
 ## Features
-- **Discover:** search GitHub. Results show stars, latest release date, whether there's a Windows build, and whether you already have it.
-- **Install** from a GitHub project, a GitHub release asset, or any direct `https://` download (`.zip`, `.7z`, `.exe`, `.bat`, `.cmd`).
+- **Several sites:** GitHub, GitLab and Codeberg are built in. You can add your own GitHub Enterprise, GitLab, Gitea or Forgejo server in **Settings → Sources**.
+- **Discover:** search one site or all of them at once. Results show stars, latest release date, whether there's a Windows build, and whether you already have it.
+  - Optionally include **forks** and show only forks with changes of their own (e.g. `+124 / −4` commits ahead of / behind the original).
+- **Install** from a project page or release file on any of your sources, or any direct `https://` download (`.zip`, `.7z`, `.exe`, `.bat`, `.cmd`).
   - Only Windows builds for your CPU are picked.
   - Downloads are checked against the SHA-256 that GitHub publishes.
 - **Safe updates:** new files are staged, then merged into the program folder all-or-nothing, with rollback.
@@ -65,7 +67,8 @@ Tests never touch your real settings or programs; they use temporary folders. Gi
 ## Troubleshooting
 - **"Some of X's files can't be opened by your Windows account":** versions up to 0.7 could leave installed files readable only by administrators, especially if the manager was run as administrator. Right-click the program and choose **Repair permissions**. Windows may ask for administrator approval.
 - **A program won't start and the message mentions antivirus:** Windows Security may have quarantined it. Check *Windows Security → Virus & threat protection → Protection history*.
-- **Update checks fail with "rate limit":** GitHub allows 60 requests per hour without a token. Add a token in **Settings → GitHub** to raise this to 5,000.
+- **Update checks fail with "rate limit":** GitHub allows 60 requests per hour without a token. Add one in **Settings → Sources → GitHub**; it raises the limit to 5,000. If you use the GitHub CLI, the **Use my GitHub CLI login** button fills it in. Answers that haven't changed are cached, and GitHub doesn't count those cached checks against the limit when you're using a token.
+- **Forks show "not compared":** the site's API limit was reached, or the site can't compare forks (Codeberg/Gitea servers often can't).
 
 ## Project docs
 - [`docs/CODE_REVIEW.md`](docs/CODE_REVIEW.md): the full code review (82 findings) and how each was resolved

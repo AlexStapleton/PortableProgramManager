@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import re
 import types
 from dataclasses import MISSING, Field, asdict, dataclass, field, fields
 from datetime import datetime, timezone
@@ -103,6 +104,15 @@ def _coerce_field(hint: Any, value: Any) -> Any:
     if get_origin(inner) is list:
         if not isinstance(value, list):
             return None
+        (item_type,) = get_args(inner) or (str,)
+        if item_type is SourceConfig:
+            sources = []
+            for item in value:
+                try:
+                    sources.append(SourceConfig.from_dict(item))
+                except (TypeError, ValueError):
+                    continue  # one broken entry shouldn't drop the others
+            return sources
         return [item for item in value if isinstance(item, str)]
     if inner is bool:
         return _coerce_bool(value)
@@ -195,6 +205,8 @@ class ManagedProgram:
     last_update_status: str = "not_yet_checked"
     last_error_message: Optional[str] = None
     last_error_at: Optional[str] = None
+    # Id of the SourceConfig (GitHub, GitLab, Codeberg...) the program was installed from.
+    provider_id: str = "github"
     # An update downloaded ahead of time ("download only" mode), ready to apply.
     pending_update_version: Optional[str] = None
     pending_update_file: Optional[str] = None
@@ -210,6 +222,53 @@ class ManagedProgram:
     def from_dict(cls, payload: dict) -> "ManagedProgram":
         # Legacy null tags/notes/launch_args and non-dict update_policy are handled by the coercion rules.
         return cls(**_coerce_payload(cls, payload))
+
+
+SOURCE_KINDS = ("github", "gitlab", "gitea")
+
+
+@dataclass
+class SourceConfig:
+    """A code-hosting site the app can search, install from and check for updates.
+
+    ``kind`` picks the API: "github" (github.com or GitHub Enterprise),
+    "gitlab" (gitlab.com or self-hosted) or "gitea" (Gitea, Forgejo, Codeberg).
+    ``base_url`` is the site's web address, e.g. ``https://gitlab.com``; each
+    provider derives its API address from it. ``token`` is kept decrypted in
+    memory and encrypted on disk by Storage.
+    """
+    id: str
+    name: str
+    kind: str
+    base_url: str
+    token: str = ""
+    enabled: bool = True
+    searchable: bool = True
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "SourceConfig":
+        values = _coerce_payload(cls, payload)
+        values["id"] = re.sub(r"[^a-z0-9_-]+", "-", values["id"].strip().lower()).strip("-")
+        if not values["id"]:
+            raise ValueError("SourceConfig missing required field id")
+        if values["kind"] not in SOURCE_KINDS:
+            raise ValueError(f"Unknown source kind {values['kind']!r}")
+        values["base_url"] = values["base_url"].strip().rstrip("/")
+        if not values["base_url"].startswith("https://"):
+            raise ValueError("Source addresses must start with https://")
+        return cls(**values)
+
+
+def default_sources() -> list[SourceConfig]:
+    """The sources a fresh install starts with; users can edit or add more."""
+    return [
+        SourceConfig(id="github", name="GitHub", kind="github", base_url="https://github.com"),
+        SourceConfig(id="gitlab", name="GitLab", kind="gitlab", base_url="https://gitlab.com"),
+        SourceConfig(id="codeberg", name="Codeberg", kind="gitea", base_url="https://codeberg.org"),
+    ]
 
 
 @dataclass
@@ -228,6 +287,20 @@ class AppSettings:
     close_to_tray: bool = True
     # "system" follows Windows light/dark mode; "light" or "dark" force one.
     theme: str = "system"
+    # Code-hosting sites to search and install from (see SourceConfig).
+    sources: list[SourceConfig] = field(default_factory=default_sources)
+
+    def __post_init__(self) -> None:
+        # The GitHub source owns the token; github_token mirrors it so older code
+        # keeps working. A token given only on the legacy field is moved over.
+        github = self.source("github")
+        if github is not None:
+            if self.github_token and not github.token:
+                github.token = self.github_token
+            self.github_token = github.token
+
+    def source(self, source_id: str) -> SourceConfig | None:
+        return next((s for s in self.sources if s.id == source_id), None)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -241,7 +314,27 @@ class AppSettings:
         values["search_result_limit"] = min(max(values["search_result_limit"], 5), 50)
         if values["theme"] not in THEME_MODES:
             values["theme"] = "system"
+        values["sources"] = _normalise_sources(values["sources"], values["github_token"])
+        # github_token mirrors the GitHub source's token for code that predates Sources.
+        values["github_token"] = next(s.token for s in values["sources"] if s.id == "github")
         return cls(**values)
 
 
 THEME_MODES = ("system", "light", "dark")
+
+
+def _normalise_sources(sources: list[SourceConfig], legacy_github_token: str) -> list[SourceConfig]:
+    """Drop duplicate ids, always keep a GitHub source, and move a pre-Sources
+    GitHub token onto it."""
+    seen: set[str] = set()
+    unique = []
+    for source in sources:
+        if source.id not in seen:
+            seen.add(source.id)
+            unique.append(source)
+    if "github" not in seen:
+        unique.insert(0, default_sources()[0])
+    github = next(s for s in unique if s.id == "github")
+    if legacy_github_token and not github.token:
+        github.token = legacy_github_token
+    return unique

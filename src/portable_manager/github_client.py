@@ -84,10 +84,12 @@ class GitHubRepo:
     parent_full_name: str = ""
     ahead_by: int | None = None
     behind_by: int | None = None
+    # Id of the SourceConfig this result came from (GitHub, GitLab, Codeberg...).
+    source_id: str = "github"
 
 
-def _github_path_segments(url: str) -> list[str] | None:
-    """Return the non-empty path segments of a github.com URL, or None for any other host."""
+def _github_path_segments(url: str, hosts: set[str] | frozenset[str] = frozenset(_GITHUB_HOSTS)) -> list[str] | None:
+    """Return the non-empty path segments of a URL on one of *hosts*, or None for any other host."""
     raw = (url or "").strip()
     if not raw:
         return None
@@ -97,7 +99,7 @@ def _github_path_segments(url: str) -> list[str] | None:
         parts = urlsplit(raw)
     except ValueError:
         return None
-    if parts.scheme not in ("http", "https") or (parts.hostname or "") not in _GITHUB_HOSTS:
+    if parts.scheme not in ("http", "https") or (parts.hostname or "").lower() not in hosts:
         return None
     return [segment for segment in parts.path.split("/") if segment]
 
@@ -110,12 +112,12 @@ def _owner_repo(owner: str, repo: str) -> str | None:
     return full_name if _REPO_FULL_NAME_RE.match(full_name) else None
 
 
-def parse_release_asset_url(url: str) -> tuple[str, str] | None:
+def parse_release_asset_url(url: str, hosts: set[str] | frozenset[str] = frozenset(_GITHUB_HOSTS)) -> tuple[str, str] | None:
     """Return ``(owner/repo, tag)`` for a ``github.com/{owner}/{repo}/releases/download/{tag}/{file}`` URL.
 
     The tag is percent-decoded. Returns None for any other URL.
     """
-    segments = _github_path_segments(url)
+    segments = _github_path_segments(url, hosts)
     if not segments or len(segments) < 6:
         return None
     if segments[2] != "releases" or segments[3] != "download":
@@ -140,7 +142,25 @@ def _sha256_digest(value: object) -> str:
 
 
 class GitHubClient:
-    def __init__(self, token: str = "", cache: ConditionalCache | None = None) -> None:
+    """GitHub API client; also the "github" source provider (github.com or GitHub Enterprise)."""
+
+    kind = "github"
+
+    def __init__(
+        self,
+        token: str = "",
+        cache: ConditionalCache | None = None,
+        base_url: str = "https://github.com",
+        source_id: str = "github",
+        name: str = "GitHub",
+    ) -> None:
+        self.source_id = source_id
+        self.name = name
+        self.base_url = base_url.rstrip("/")
+        host = (urlsplit(self.base_url).hostname or "github.com").lower()
+        self.web_hosts = frozenset({host, f"www.{host}"})
+        # github.com has its own API host; GitHub Enterprise serves the API under /api/v3.
+        self.api_root = API_ROOT if host == "github.com" else f"{self.base_url}/api/v3"
         self.session = requests.Session()
         # Conditional-request cache (shared across clients); None disables it.
         self.cache = cache
@@ -180,7 +200,7 @@ class GitHubClient:
         Returns the remaining count (also stored on the client), or None if unknown.
         """
         try:
-            response = self.session.get(f"{API_ROOT}/rate_limit", timeout=DEFAULT_TIMEOUT)
+            response = self.session.get(f"{self.api_root}/rate_limit", timeout=DEFAULT_TIMEOUT)
             if response.status_code != 200:
                 return self.rate_limit_remaining
             core = (self._parse_json(response).get("resources") or {}).get("core") or {}
@@ -310,28 +330,28 @@ class GitHubClient:
         q = f"{query} fork:true" if include_forks else query
         response = self._request(
             "GET",
-            f"{API_ROOT}/search/repositories",
+            f"{self.api_root}/search/repositories",
             params={"q": q, "sort": sort, "order": "desc", "per_page": max(1, min(limit, 50))},
         )
         self._raise_for_status(response, "repository search")
         data = self._parse_json(response)
         items = data.get("items", []) if isinstance(data, dict) else []
-        return [self._repo_from_api(item) for item in items]
+        return [self._tag_source(self._repo_from_api(item)) for item in items]
 
     def get_repo(self, full_name: str) -> GitHubRepo:
         self._validate_full_name(full_name)
-        response = self._request("GET", f"{API_ROOT}/repos/{full_name}")
+        response = self._request("GET", f"{self.api_root}/repos/{full_name}")
         if response.status_code == 404:
             raise GitHubError(
                 f"Repository {full_name} was not found on GitHub. It may be private, renamed or deleted."
             )
         self._raise_for_status(response, f"repository {full_name}")
-        return self._repo_from_api(self._parse_json(response))
+        return self._tag_source(self._repo_from_api(self._parse_json(response)))
 
     def get_latest_release(self, full_name: str, include_prereleases: bool = False) -> Optional[GitHubRelease]:
         self._validate_full_name(full_name)
         if include_prereleases:
-            response = self._request("GET", f"{API_ROOT}/repos/{full_name}/releases")
+            response = self._request("GET", f"{self.api_root}/repos/{full_name}/releases")
             if response.status_code == 404:
                 return None
             self._raise_for_status(response, f"releases of {full_name}")
@@ -340,15 +360,17 @@ class GitHubClient:
                 return None
             return self._release_from_api(releases[0])
 
-        response = self._request("GET", f"{API_ROOT}/repos/{full_name}/releases/latest")
+        response = self._request("GET", f"{self.api_root}/repos/{full_name}/releases/latest")
         if response.status_code == 404:
             return None
         self._raise_for_status(response, f"latest release of {full_name}")
         return self._release_from_api(self._parse_json(response))
 
     # Asset name patterns that indicate a Windows build.
+    # "win" only counts as its own word ("app-win64.zip", "windows"), not inside
+    # "darwin" or "twinkle".
     _WIN_ASSET_RE = re.compile(
-        r"(win|windows|win32|win64|x86_64.*pc.*windows|msvc|mingw"
+        r"((?<![a-z])win(?:dows|32|64)?(?![a-z])|x86_64.*pc.*windows|msvc|mingw"
         r"|\.msi\b|\.msix\b|\.appx\b|\.appxbundle\b|\.exe\b|setup\.zip)",
         re.IGNORECASE,
     )
@@ -361,7 +383,7 @@ class GitHubClient:
         or GitHub can't compare them (e.g. unrelated histories).
         """
         self._validate_full_name(full_name)
-        response = self._request("GET", f"{API_ROOT}/repos/{full_name}")
+        response = self._request("GET", f"{self.api_root}/repos/{full_name}")
         self._raise_for_status(response, f"repository {full_name}")
         data = self._parse_json(response)
         parent = data.get("parent") if isinstance(data, dict) else None
@@ -373,7 +395,7 @@ class GitHubClient:
         fork_branch = data.get("default_branch") or "main"
         self._validate_full_name(parent_name)
         compare_url = (
-            f"{API_ROOT}/repos/{parent_name}/compare/"
+            f"{self.api_root}/repos/{parent_name}/compare/"
             f"{quote(parent_branch, safe='')}...{fork_owner}:{fork_repo}:{quote(fork_branch, safe='')}"
         )
         response = self._request("GET", compare_url)
@@ -389,7 +411,7 @@ class GitHubClient:
         Returns ``("", False)`` when no release exists or on error.
         """
         self._validate_full_name(full_name)
-        response = self._request("GET", f"{API_ROOT}/repos/{full_name}/releases/latest")
+        response = self._request("GET", f"{self.api_root}/repos/{full_name}/releases/latest")
         if response.status_code == 404:
             return "", False
         try:
@@ -419,7 +441,7 @@ class GitHubClient:
         Release download links and other file links return None, so they can be
         installed as direct URLs instead of being treated as the whole repository.
         """
-        segments = _github_path_segments(url)
+        segments = _github_path_segments(url, self.web_hosts)
         if not segments or len(segments) < 2:
             return None
         owner, repo = segments[0], segments[1].removesuffix(".git")
@@ -431,10 +453,14 @@ class GitHubClient:
             return None
         return _owner_repo(owner, repo)
 
+    def parse_release_asset_url(self, url: str) -> tuple[str, str] | None:
+        """``(owner/repo, tag)`` for a release download link on this GitHub host, else None."""
+        return parse_release_asset_url(url, self.web_hosts)
+
     def infer_repo_from_asset_url(self, url: str) -> Optional[str]:
         parsed = urlparse(url)
-        if parsed.netloc.lower() in _GITHUB_HOSTS:
-            asset = parse_release_asset_url(url)
+        if parsed.netloc.lower() in self.web_hosts:
+            asset = parse_release_asset_url(url, self.web_hosts)
             return asset[0] if asset else None
 
         if parsed.netloc not in {"objects.githubusercontent.com", "github-releases.githubusercontent.com"}:
@@ -445,6 +471,10 @@ class GitHubClient:
         if len(parts) >= 4 and parts[2] == "releases":
             return f"{parts[0]}/{parts[1]}"
         return None
+
+    def _tag_source(self, repo: GitHubRepo) -> GitHubRepo:
+        repo.source_id = self.source_id
+        return repo
 
     @staticmethod
     def _repo_from_api(item: dict) -> GitHubRepo:

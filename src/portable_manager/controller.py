@@ -15,7 +15,8 @@ from typing import Callable
 from . import fsops
 from .errors import AlreadyUpToDateError, InstallError, ProgramInUseError
 from .http_cache import ConditionalCache
-from .github_client import GitHubClient, GitHubRelease, GitHubReleaseAsset, GitHubRepo, parse_release_asset_url
+from .github_client import GitHubClient, GitHubRelease, GitHubReleaseAsset, GitHubRepo
+from .sources import SourceRegistry
 from .installer import PortableInstaller, normalize_dir
 from .launcher import PERMISSION_PROBLEM_MESSAGE, launch_program
 from .models import AppSettings, ManagedProgram, UpdatePolicy
@@ -81,42 +82,110 @@ class AppController:
         self._program_index: dict[str, ManagedProgram] = {p.program_id: p for p in self.programs}
         # Remembers API answers so unchanged ones cost no rate limit (see http_cache).
         self.http_cache = ConditionalCache(storage.base_dir / "http_cache.json")
-        self.github = GitHubClient(token=self.settings.github_token, cache=self.http_cache)
+        # One provider per enabled source (GitHub, GitLab, Codeberg, self-hosted...).
+        self.sources = SourceRegistry(self.settings.sources, self.http_cache)
+        self._github_fallback: GitHubClient | None = None
         self.installer = PortableInstaller(self.settings, self.github)
         self._lock = RLock()
 
+    @property
+    def github(self) -> GitHubClient:
+        """The GitHub provider (a plain client is used even if the user disabled the source)."""
+        provider = self.sources.get("github")
+        if provider is not None:
+            return provider
+        if self._github_fallback is None:
+            self._github_fallback = GitHubClient(token=self.settings.github_token, cache=self.http_cache)
+        return self._github_fallback
+
+    @github.setter
+    def github(self, provider) -> None:
+        self.sources.set("github", provider)
+
     def reload_clients(self) -> None:
         with self._lock:
-            old = self.github
-            self.github = GitHubClient(token=self.settings.github_token, cache=self.http_cache)
+            self.sources.reload(self.settings.sources)
             self.installer = PortableInstaller(self.settings, self.github)
-        old.close()
 
     def shutdown(self) -> None:
         """Flush caches and close network sessions when the app exits."""
         self.http_cache.save(force=True)
-        with self._lock:
-            self.github.close()
+        self.sources.close()
 
     def _get_github(self) -> GitHubClient:
-        """Return the shared GitHubClient, creating/replacing it only when the token changes."""
-        with self._lock:
+        return self.github
+
+    def provider_for(self, source_id: str | None):
+        """The provider for a program's or result's source, with a clear error if it's gone."""
+        source_id = source_id or "github"
+        if source_id == "github":
             return self.github
+        provider = self.sources.get(source_id)
+        if provider is None:
+            config = self.settings.source(source_id)
+            label = config.name if config else source_id
+            raise InstallError(
+                f"The source \"{label}\" is turned off or was removed. "
+                "Turn it back on in Settings → Sources to install or update from it."
+            )
+        return provider
+
+    def match_url(self, url: str) -> tuple[str, str | None] | None:
+        """``(source_id, project path or None)`` when *url* is on one of the user's sources."""
+        match = self.sources.match_url(url)
+        if match is None:
+            return None
+        provider, path = match
+        return provider.source_id, path
+
+    def source_names(self) -> dict[str, str]:
+        """Source id → display name, for labels in the UI."""
+        with self._lock:
+            return {s.id: s.name for s in self.settings.sources}
 
     def search_github(
         self,
         query: str,
         sort: str = "stars",
         include_forks: bool = False,
+        source_id: str | None = None,
         progress_callback: ProgressCallback = None,
     ) -> list[GitHubRepo]:
-        if progress_callback:
-            progress_callback(10, f"Searching GitHub for '{query}'")
+        """Search one source, or every source marked "include in search" when *source_id* is None.
+
+        Sources are searched in parallel and the results merged in the requested
+        order. A failing source is skipped (and logged) unless every source fails.
+        """
         with self._lock:
             limit = self.settings.search_result_limit
-        results = self._get_github().search_repositories(
-            query, limit=limit, sort=sort, include_forks=include_forks
-        )
+        if source_id:
+            providers = [self.provider_for(source_id)]
+        else:
+            providers = self.sources.searchable() or [self.github]
+        names = ", ".join(getattr(p, "name", "GitHub") for p in providers)
+        if progress_callback:
+            progress_callback(10, f"Searching {names} for '{query}'")
+
+        results: list[GitHubRepo] = []
+        errors: list[Exception] = []
+        with ThreadPoolExecutor(max_workers=max(1, len(providers))) as pool:
+            futures = {
+                pool.submit(p.search_repositories, query, limit=limit, sort=sort, include_forks=include_forks): p
+                for p in providers
+            }
+            for future in as_completed(futures):
+                try:
+                    results.extend(future.result())
+                except Exception as exc:
+                    log.info("Search on %s failed: %s", getattr(futures[future], "name", "?"), exc)
+                    errors.append(exc)
+        if errors and not results and len(errors) == len(providers):
+            raise errors[0]
+        if len(providers) > 1:
+            if sort == "updated":
+                results.sort(key=lambda r: r.pushed_at or r.updated_at or "", reverse=True)
+            else:
+                results.sort(key=lambda r: r.stars, reverse=True)
         if progress_callback:
             progress_callback(100, f"Loaded {len(results)} search results")
         return results
@@ -128,41 +197,51 @@ class AppController:
         more (fork vs. original comparison). When the rate limit is nearly used
         up, the remaining repos are left unchecked rather than burning the last calls.
         """
-        github = self._get_github()
         enriched = [dataclasses.replace(repo) for repo in repos]
         total = len(enriched)
-        if github.rate_limit_remaining is None:
-            github.refresh_rate_limit()  # free; search results don't report the core quota
-        budget = None if github.rate_limit_remaining is None else max(0, github.rate_limit_remaining - 5)
-        targets: list[GitHubRepo] = []
+        providers: dict[str, object] = {}
+        budgets: dict[str, int | None] = {}
+        targets: list[tuple[GitHubRepo, object]] = []
         for repo in enriched:
+            source_id = repo.source_id or "github"
+            if source_id not in providers:
+                try:
+                    provider = self.provider_for(source_id)
+                except InstallError:
+                    continue
+                if provider.rate_limit_remaining is None:
+                    provider.refresh_rate_limit()  # free where the site allows it
+                providers[source_id] = provider
+                remaining = provider.rate_limit_remaining
+                budgets[source_id] = None if remaining is None else max(0, remaining - 5)
             cost = 3 if repo.is_fork else 1
+            budget = budgets[source_id]
             if budget is not None:
                 if cost > budget:
                     continue
-                budget -= cost
-            targets.append(repo)
+                budgets[source_id] = budget - cost
+            targets.append((repo, providers[source_id]))
 
-        def _lookup(repo: GitHubRepo) -> None:
+        def _lookup(repo: GitHubRepo, provider) -> None:
             try:
-                repo.latest_release_at, repo.has_windows_release = github.get_latest_release_info(repo.full_name)
+                repo.latest_release_at, repo.has_windows_release = provider.get_latest_release_info(repo.full_name)
             except Exception:
                 repo.latest_release_at, repo.has_windows_release = "", None
             if repo.is_fork:
                 try:
-                    repo.parent_full_name, repo.ahead_by, repo.behind_by = github.compare_fork_with_parent(repo.full_name)
+                    repo.parent_full_name, repo.ahead_by, repo.behind_by = provider.compare_fork_with_parent(repo.full_name)
                 except Exception:
                     log.info("Couldn't compare fork %s with its parent", repo.full_name, exc_info=True)
 
         done = 0
         with ThreadPoolExecutor(max_workers=_MAX_PARALLEL_REQUESTS) as pool:
-            for _ in as_completed([pool.submit(_lookup, repo) for repo in targets]):
+            for _ in as_completed([pool.submit(_lookup, repo, provider) for repo, provider in targets]):
                 done += 1
                 if progress_callback:
                     progress_callback(int(done / max(total, 1) * 100), f"Fetching release info ({done}/{total})")
         if progress_callback:
             skipped = total - len(targets)
-            note = f" ({skipped} skipped to stay under GitHub's rate limit)" if skipped else ""
+            note = f" ({skipped} skipped to stay under the API rate limit)" if skipped else ""
             progress_callback(100, f"Fetched release info for {len(targets)} repos{note}")
         return enriched
 
@@ -170,13 +249,16 @@ class AppController:
         self,
         repo_full_name: str,
         channel: str = "latest_release",
+        source_id: str = "github",
         progress_callback: ProgressCallback = None,
     ) -> InstallOutcome:
+        provider = self.provider_for(source_id)
         with self._lock:
             installer = self.installer
             taken = self._taken_dirs_no_lock()
         result = installer.install_from_repo(
-            repo_full_name, channel=channel, progress_callback=progress_callback, taken_dirs=taken
+            repo_full_name, channel=channel, progress_callback=progress_callback, taken_dirs=taken,
+            provider=provider,
         )
         self._upsert_program(result.program)
         return InstallOutcome(program=copy.deepcopy(result.program), is_likely_installer=result.is_likely_installer)
@@ -187,15 +269,18 @@ class AppController:
         display_name: str | None = None,
         progress_callback: ProgressCallback = None,
     ) -> InstallOutcome:
+        match = self.sources.match_url(url)
+        provider = match[0] if match else None
         with self._lock:
             installer = self.installer
             taken = self._taken_dirs_no_lock()
         result = installer.install_from_url(
-            url, display_name=display_name, progress_callback=progress_callback, taken_dirs=taken
+            url, display_name=display_name, progress_callback=progress_callback, taken_dirs=taken,
+            provider=provider,
         )
-        # A GitHub release URL carries its tag, so the installed version is known
+        # A release URL carries its tag, so the installed version is known
         # (otherwise the first update check would always report an update).
-        parsed = parse_release_asset_url(url)
+        parsed = (provider or self.github).parse_release_asset_url(url)
         if parsed and not result.program.version:
             result.program.version = parsed[1]
             result.program.latest_upstream_version = parsed[1]
@@ -351,10 +436,11 @@ class AppController:
         with self._lock:
             self.settings = settings
             self.storage.save_settings(settings)
-            old_github = self.github
-            self.github = GitHubClient(token=self.settings.github_token, cache=self.http_cache)
+            self.sources.reload(settings.sources)
+            if self._github_fallback is not None:
+                self._github_fallback.close()
+                self._github_fallback = None
             self.installer = PortableInstaller(self.settings, self.github)
-            old_github.close()
             updated = False
             for program in self.programs:
                 policy = program.update_policy
@@ -597,7 +683,7 @@ class AppController:
         """Fetch the latest release for *program* and pick the asset to install from it."""
         if not program.repo_full_name:
             raise InstallError("This program has no GitHub repository to update from.")
-        release = self._get_github().get_latest_release(
+        release = self.provider_for(program.provider_id).get_latest_release(
             program.repo_full_name, include_prereleases=program.update_policy.channel == "prerelease"
         )
         if not release:
@@ -738,12 +824,14 @@ class AppController:
             progress_callback(100, f"Updated {result.name}")
         return result
 
-    def find_managed_program(self, repo_full_name: str | None = None, url: str | None = None) -> ManagedProgram | None:
+    def find_managed_program(
+        self, repo_full_name: str | None = None, url: str | None = None, source_id: str = "github"
+    ) -> ManagedProgram | None:
         """Return the managed program installed from this repo or URL, if any (for reinstall prompts)."""
         with self._lock:
             for program in self.programs:
                 if repo_full_name and (program.repo_full_name or "").lower() == repo_full_name.lower() \
-                        and program.source_type == "github_repo":
+                        and program.source_type == "github_repo" and program.provider_id == source_id:
                     return copy.deepcopy(program)
                 if url and program.source_value == url:
                     return copy.deepcopy(program)

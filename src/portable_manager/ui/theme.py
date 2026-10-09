@@ -564,6 +564,19 @@ QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {
     background-color: $disabled_bg;
     border-color: $border_strong;
 }
+/* Checkboxes inside tables and lists (e.g. Settings → Sources) */
+QAbstractItemView::indicator {
+    width: 15px;
+    height: 15px;
+    background-color: $field;
+    border: 1px solid $check_border;
+    border-radius: 4px;
+}
+QAbstractItemView::indicator:checked {
+    background-color: $accent;
+    border-color: $accent;
+    image: url("$check_png");
+}
 
 /* Progress bar: thin with accent chunk -------------------------------- */
 QProgressBar {

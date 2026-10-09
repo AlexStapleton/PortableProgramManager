@@ -1,14 +1,13 @@
 from __future__ import annotations
 
+import copy
 import dataclasses
 import shutil
 import subprocess
 from pathlib import Path
 
-import requests
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -16,11 +15,14 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -28,8 +30,7 @@ from PySide6.QtWidgets import (
 
 from .. import fsops
 from ..errors import InstallError
-from ..github_client import API_ROOT, USER_AGENT
-from ..models import AppSettings
+from ..models import AppSettings, SourceConfig
 from .theme import status_color
 
 # (label, stored value) pairs shared with the program edit dialog.
@@ -50,6 +51,15 @@ THEME_CHOICES = [
     ("Light", "light"),
     ("Dark", "dark"),
 ]
+# (label, SourceConfig.kind) pairs for a source's type, shared with the source dialog.
+SOURCE_TYPE_CHOICES = [
+    ("GitHub", "github"),
+    ("GitLab", "gitlab"),
+    ("Gitea / Forgejo / Codeberg", "gitea"),
+]
+SOURCE_TYPE_NAMES = {"github": "GitHub", "gitlab": "GitLab", "gitea": "Gitea · Forgejo · Codeberg"}
+SOURCE_HEADERS = ["Name", "Type", "Address", "Token", "Enabled", "Include in search"]
+_GITHUB_REMOVE_TIP = "GitHub is built in, so it can't be removed. Clear Enabled to stop using it."
 
 
 # ----------------------------------------------------------------------
@@ -193,7 +203,7 @@ def clear_folder_contents(folder: Path) -> list[str]:
 
 
 # ----------------------------------------------------------------------
-# GitHub token test
+# Rate-limit reply text (GitHub's /rate_limit answer)
 # ----------------------------------------------------------------------
 
 
@@ -215,18 +225,27 @@ def describe_rate_limit(response, has_token: bool) -> tuple[str, str]:
     return f"No token entered. Without one, {left}.", "muted"
 
 
+def _checkbox_item(checked: bool) -> QTableWidgetItem:
+    item = QTableWidgetItem()
+    item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+    item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+    return item
+
+
 class SettingsDialog(QDialog):
     def __init__(self, settings: AppSettings, parent=None) -> None:
         super().__init__(parent)
         self._base = settings
+        # Edited on a copy, so cancelling leaves the original settings untouched.
+        self._sources: list[SourceConfig] = copy.deepcopy(settings.sources)
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(560)
+        self.setMinimumWidth(740)  # wide enough for the six columns of the Sources table
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_general_page(settings), "General")
         self.tabs.addTab(self._build_updates_page(settings), "Updates")
-        self.tabs.addTab(self._build_github_page(settings), "GitHub")
-        self.tabs.addTab(self._build_appearance_page(settings), "Appearance & tray")
+        self.tabs.addTab(self._build_sources_page(), "Sources")
+        self.tabs.addTab(self._build_appearance_page(settings), "Appearance && tray")
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         ok_button = buttons.button(QDialogButtonBox.Ok)
@@ -314,36 +333,48 @@ class SettingsDialog(QDialog):
         )
         return page
 
-    def _build_github_page(self, settings: AppSettings) -> QWidget:
+    def _build_sources_page(self) -> QWidget:
         page = QWidget()
-        form = QFormLayout(page)
+        layout = QVBoxLayout(page)
 
-        form.addRow(
+        layout.addWidget(
             subtle_label(
-                "Optional. A personal access token raises GitHub's API limit from 60 to 5,000 "
-                "requests per hour. It is stored encrypted for your Windows account."
+                "Sites the app can search, install from and check for updates. Add a self-hosted GitLab, "
+                "Gitea or Forgejo server, or GitHub Enterprise."
             )
         )
 
-        self.github_token = QLineEdit(settings.github_token)
-        self.github_token.setEchoMode(QLineEdit.EchoMode.Password)
-        self.github_token.setPlaceholderText("Optional")
-        self.show_token = QPushButton("Show")
-        self.show_token.setCheckable(True)
-        self.show_token.setProperty("variant", "secondary")
-        self.show_token.toggled.connect(self._toggle_token_visible)
-        form.addRow("Token", hbox(self.github_token, self.show_token))
+        self.sources_table = QTableWidget(0, len(SOURCE_HEADERS))
+        self.sources_table.setHorizontalHeaderLabels(SOURCE_HEADERS)
+        self.sources_table.verticalHeader().hide()
+        self.sources_table.setShowGrid(False)
+        self.sources_table.setAlternatingRowColors(True)  # colours come from the theme palette
+        self.sources_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.sources_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.sources_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        header = self.sources_table.horizontalHeader()
+        for column in range(len(SOURCE_HEADERS)):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)  # Name takes the spare width
+        self.sources_table.setMinimumHeight(180)
+        self.sources_table.itemChanged.connect(self._on_source_item_changed)
+        self.sources_table.itemSelectionChanged.connect(self._update_source_buttons)
+        self.sources_table.doubleClicked.connect(self._on_source_double_clicked)
+        layout.addWidget(self.sources_table)
 
-        self.token_result = QLabel()
-        self.token_result.setWordWrap(True)
-        self.github_token.textChanged.connect(self._clear_token_result)
-        self.test_token_button = make_button("Test token", slot=self._test_token)
-        self.gh_cli_button = make_button("Use my GitHub CLI login", slot=self._import_gh_cli_token)
-        self.gh_cli_button.setToolTip(
-            "If you're signed in with the GitHub CLI (gh auth login), copy its token here."
+        self.add_source_button = make_button("Add…", variant="primary", slot=self._add_source)
+        self.edit_source_button = make_button("Edit…", slot=self._edit_source)
+        self.remove_source_button = make_button("Remove", variant="danger", slot=self._remove_source)
+        self.test_source_button = make_button("Test", slot=self._test_selected_source)
+        layout.addWidget(
+            hbox(self.add_source_button, self.edit_source_button, self.remove_source_button, self.test_source_button)
         )
-        self.gh_cli_button.setVisible(find_gh_cli() is not None)
-        form.addRow("", hbox(self.test_token_button, self.gh_cli_button, self.token_result))
+
+        self.sources_result = QLabel()
+        self.sources_result.setWordWrap(True)
+        layout.addWidget(self.sources_result)
+
+        self._refresh_sources_table()
         return page
 
     def _build_appearance_page(self, settings: AppSettings) -> QWidget:
@@ -417,51 +448,102 @@ class SettingsDialog(QDialog):
         self._update_mode_prev = value
 
     # ------------------------------------------------------------------
-    # GitHub page helpers
+    # Sources page helpers
     # ------------------------------------------------------------------
 
-    def _toggle_token_visible(self, checked: bool) -> None:
-        self.github_token.setEchoMode(QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password)
-        self.show_token.setText("Hide" if checked else "Show")
-
-    def _clear_token_result(self) -> None:
-        self.token_result.clear()
-
-    def _show_token_result(self, text: str, kind: str) -> None:
-        self.token_result.setText(text)
-        self.token_result.setStyleSheet(f"color: {status_color(kind).name()};")
-
-    def _import_gh_cli_token(self) -> None:
-        """Fill the token from ``gh auth token`` (the token itself is never shown or logged)."""
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+    def _refresh_sources_table(self, select: int | None = None) -> None:
+        """Rebuild the table from ``self._sources`` (row N is always source N)."""
+        table = self.sources_table
+        table.blockSignals(True)
         try:
-            token, error = read_gh_cli_token()
+            table.setRowCount(0)
+            for row, source in enumerate(self._sources):
+                table.insertRow(row)
+                table.setItem(row, 0, QTableWidgetItem(source.name))
+                table.setItem(row, 1, QTableWidgetItem(SOURCE_TYPE_NAMES.get(source.kind, source.kind)))
+                table.setItem(row, 2, QTableWidgetItem(source.base_url))
+                table.setItem(row, 3, QTableWidgetItem("✓ set" if source.token else "—"))
+                table.setItem(row, 4, _checkbox_item(source.enabled))
+                table.setItem(row, 5, _checkbox_item(source.searchable))
         finally:
-            QApplication.restoreOverrideCursor()
-        if not token:
-            self._show_token_result(error, "error")
+            table.blockSignals(False)
+        if select is not None and 0 <= select < table.rowCount():
+            table.selectRow(select)
+        self._update_source_buttons()
+
+    def _selected_row(self) -> int:
+        rows = self.sources_table.selectionModel().selectedRows()
+        return rows[0].row() if rows else -1
+
+    def _update_source_buttons(self) -> None:
+        row = self._selected_row()
+        has_row = 0 <= row < len(self._sources)
+        self.edit_source_button.setEnabled(has_row)
+        self.test_source_button.setEnabled(has_row)
+        is_github = has_row and self._sources[row].id == "github"
+        self.remove_source_button.setEnabled(has_row and not is_github)
+        if is_github:
+            tip = _GITHUB_REMOVE_TIP
+        elif has_row:
+            tip = "Remove the selected source from the list."
+        else:
+            tip = "Select a source to remove it."
+        self.remove_source_button.setToolTip(tip)
+
+    def _on_source_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() not in (4, 5) or not (0 <= item.row() < len(self._sources)):
             return
-        self.github_token.setText(token)
-        self._show_token_result("✓ Copied the token from your GitHub CLI login. Click OK to save it.", "ok")
+        checked = item.checkState() == Qt.CheckState.Checked
+        source = self._sources[item.row()]
+        if item.column() == 4:
+            source.enabled = checked
+        else:
+            source.searchable = checked
 
-    def _test_token(self) -> None:
-        token = self.github_token.text().strip()
-        headers = {"Accept": "application/vnd.github+json", "User-Agent": USER_AGENT}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+    def _on_source_double_clicked(self, index) -> None:
+        if index.column() >= 4:  # the checkbox columns toggle instead
+            return
+        self.sources_table.selectRow(index.row())
+        self._edit_source()
 
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            try:
-                response = requests.get(f"{API_ROOT}/rate_limit", headers=headers, timeout=10)
-            except requests.RequestException as exc:
-                detail = str(exc).replace(token, "***") if token else str(exc)
-                text, kind = f"Couldn't reach GitHub: {detail}", "error"
-            else:
-                text, kind = describe_rate_limit(response, has_token=bool(token))
-        finally:
-            QApplication.restoreOverrideCursor()
-        self._show_token_result(text, kind)
+    def _add_source(self) -> None:
+        from .source_dialog import SourceDialog  # imported here: source_dialog imports this module
+
+        dialog = SourceDialog(others=list(self._sources), parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self._sources.append(dialog.get_config())
+        self._refresh_sources_table(select=len(self._sources) - 1)
+
+    def _edit_source(self) -> None:
+        from .source_dialog import SourceDialog  # imported here: source_dialog imports this module
+
+        row = self._selected_row()
+        if not (0 <= row < len(self._sources)):
+            return
+        others = [source for i, source in enumerate(self._sources) if i != row]
+        dialog = SourceDialog(source=self._sources[row], others=others, parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self._sources[row] = dialog.get_config()
+        self._refresh_sources_table(select=row)
+
+    def _remove_source(self) -> None:
+        row = self._selected_row()
+        if not (0 <= row < len(self._sources)) or self._sources[row].id == "github":
+            return
+        del self._sources[row]
+        self._refresh_sources_table(select=min(row, len(self._sources) - 1))
+
+    def _test_selected_source(self) -> None:
+        from .source_dialog import check_source_connection  # imported here: source_dialog imports this module
+
+        row = self._selected_row()
+        if not (0 <= row < len(self._sources)):
+            return
+        message, kind = check_source_connection(self._sources[row])
+        self.sources_result.setText(message)
+        self.sources_result.setStyleSheet(f"color: {status_color(kind).name()};")
 
     # ------------------------------------------------------------------
     # Accept / result
@@ -489,11 +571,16 @@ class SettingsDialog(QDialog):
         self.accept()
 
     def get_settings(self) -> AppSettings:
+        sources = copy.deepcopy(self._sources)
+        github = next((source for source in sources if source.id == "github"), None)
+        # The GitHub source owns the token; github_token mirrors it.
+        github_token = github.token if github is not None else self._base.github_token
         return dataclasses.replace(
             self._base,
+            sources=sources,
             install_root=self.install_root.text().strip(),
             download_cache=self.download_cache.text().strip(),
-            github_token=self.github_token.text().strip(),
+            github_token=github_token,
             auto_open_folder_after_install=self.auto_open_folder.isChecked(),
             search_result_limit=self.search_result_limit.value(),
             default_update_mode=self.default_update_mode.currentData(),

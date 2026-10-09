@@ -379,6 +379,7 @@ class MainWindow(QMainWindow):
         if self.controller.settings.theme != old_theme:
             theme.apply_theme(QApplication.instance(), self.controller.settings.theme)
         self._apply_update_schedule()
+        self.discover_tab.reload_sources()
         self.refresh_programs()
         self.set_status("Settings saved.")
 

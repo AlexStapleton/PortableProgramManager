@@ -87,11 +87,14 @@ class PortableInstaller:
         channel: str = "latest_release",
         progress_callback: ProgressCallback = None,
         taken_dirs: dict[str, str] | None = None,
+        provider=None,
     ) -> InstallResult:
+        """Install the latest release of *repo_full_name* from *provider* (default: GitHub)."""
+        source = provider or self.github
         if progress_callback:
-            progress_callback(5, f"Loading repository {repo_full_name}")
-        repo = self.github.get_repo(repo_full_name)
-        release = self.github.get_latest_release(repo_full_name, include_prereleases=channel == "prerelease")
+            progress_callback(5, f"Loading {repo_full_name} from {getattr(source, 'name', 'GitHub')}")
+        repo = source.get_repo(repo_full_name)
+        release = source.get_latest_release(repo_full_name, include_prereleases=channel == "prerelease")
         if not release:
             raise InstallError("This repository does not have a latest release.")
 
@@ -99,7 +102,12 @@ class PortableInstaller:
         if not asset:
             raise InstallError("No portable release asset was found. Try installing from a direct asset URL.")
 
-        program_id = f"repo::{repo.full_name.lower()}"
+        source_id = getattr(source, "source_id", "github")
+        # GitHub keeps its historical id format so existing registries still match.
+        program_id = (
+            f"repo::{repo.full_name.lower()}" if source_id == "github"
+            else f"repo::{source_id}:{repo.full_name.lower()}"
+        )
         install_dir = self._choose_install_dir(self._safe_name(repo.name), program_id, taken_dirs)
         fsops.ensure_writable_dir(Path(self.settings.install_root))
         downloaded_file, downloaded_hash = self._download(
@@ -144,8 +152,9 @@ class PortableInstaller:
             repo_full_name=repo.full_name,
             homepage_url=repo.homepage or repo.html_url,
             notes=repo.description,
-            source_id=f"github:{repo.full_name.lower()}",
+            source_id=f"{source_id}:{repo.full_name.lower()}",
             source_kind="repository",
+            provider_id=source_id,
             installed_asset_url=asset.download_url,
             installed_asset_name=asset.name,
             installed_asset_size=asset.size,
@@ -166,7 +175,10 @@ class PortableInstaller:
         display_name: str | None = None,
         progress_callback: ProgressCallback = None,
         taken_dirs: dict[str, str] | None = None,
+        provider=None,
     ) -> InstallResult:
+        """Install a direct download. *provider* is the source whose site the URL is on
+        (if any), so the program can follow that project's releases for updates."""
         parsed = urlparse(url)
         if parsed.scheme != "https":
             raise InstallError("Only https:// URLs are supported. HTTP downloads are rejected to prevent man-in-the-middle attacks.")
@@ -192,7 +204,8 @@ class PortableInstaller:
         finally:
             self._discard_download(downloaded_file)
 
-        repo_full_name = self.github.infer_repo_from_asset_url(url)
+        source = provider or self.github
+        repo_full_name = source.infer_repo_from_asset_url(url)
         is_installer = self.looks_like_installer(launch_path, install_dir)
         if is_installer:
             update_policy = UpdatePolicy(
@@ -219,6 +232,7 @@ class PortableInstaller:
             homepage_url=url,
             source_id=f"url:{url}",
             source_kind="direct_asset",
+            provider_id=getattr(source, "source_id", "github"),
             installed_asset_url=url,
             installed_asset_name=file_name,
             installed_hash=f"sha256:{downloaded_hash}",
