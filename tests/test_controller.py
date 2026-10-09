@@ -36,6 +36,14 @@ class FakeGitHub:
         self.info_calls.append(full_name)
         return "2026-10-01T00:00:00Z", True
 
+    def refresh_rate_limit(self):
+        self.refreshed = True
+        return self.rate_limit_remaining
+
+    def compare_fork_with_parent(self, full_name):
+        self.compare_calls = getattr(self, "compare_calls", []) + [full_name]
+        return "o/parent", 3, 1
+
     def close(self):
         pass
 
@@ -246,3 +254,25 @@ def test_list_programs_returns_copies(ctl, tmp_path):
     _add(ctl, tmp_path)
     ctl.list_programs()[0].name = "mutated"
     assert ctl.get_program("repo::o/tool").name == "Tool"
+
+
+def test_fetch_release_dates_compares_forks_and_budgets_three_calls_each(ctl):
+    def repo(i, fork):
+        r = GitHubRepo(f"o/r{i}", f"r{i}", "o", "", "", "", 0, "", "main")
+        r.is_fork = fork
+        return r
+
+    repos = [repo(0, False), repo(1, True), repo(2, True), repo(3, False)]
+    ctl.github.rate_limit_remaining = 5 + 1 + 3 + 1  # parent, one fork, then 1 left: fork r2 (3) skipped, r3 (1) fits
+    enriched = ctl.fetch_release_dates(repos)
+    assert ctl.github.info_calls == ["o/r0", "o/r1", "o/r3"] or sorted(ctl.github.info_calls) == ["o/r0", "o/r1", "o/r3"]
+    assert ctl.github.compare_calls == ["o/r1"]
+    by_name = {r.full_name: r for r in enriched}
+    assert (by_name["o/r1"].parent_full_name, by_name["o/r1"].ahead_by, by_name["o/r1"].behind_by) == ("o/parent", 3, 1)
+    assert by_name["o/r2"].ahead_by is None
+
+
+def test_fetch_release_dates_checks_quota_when_unknown(ctl):
+    ctl.github.rate_limit_remaining = None
+    ctl.fetch_release_dates([GitHubRepo("o/a", "a", "o", "", "", "", 0, "", "main")])
+    assert getattr(ctl.github, "refreshed", False)

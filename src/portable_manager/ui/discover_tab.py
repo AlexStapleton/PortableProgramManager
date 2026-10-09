@@ -135,19 +135,42 @@ def apply_filters(
     *,
     windows_only: bool,
     inactive_days: int | None,
+    forks_with_changes_only: bool = False,
     now: datetime | None = None,
 ) -> list[GitHubRepo]:
-    """Return the repos that pass the Windows and inactivity filters, in order.
+    """Return the repos that pass the Windows, inactivity and fork filters, in order.
 
-    ``inactive_days=None`` disables the inactivity filter.
+    ``inactive_days=None`` disables the inactivity filter. With
+    ``forks_with_changes_only``, forks known to have no commits beyond their
+    original are hidden (forks not compared yet stay visible until they are).
     """
     filtered = list(results)
+    if forks_with_changes_only:
+        filtered = [repo for repo in filtered if not (repo.is_fork and repo.ahead_by is not None and repo.ahead_by < 1)]
     if windows_only:
         filtered = [repo for repo in filtered if looks_windows_compatible(repo)]
     if inactive_days is not None:
         cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=inactive_days)
         filtered = [repo for repo in filtered if parse_api_timestamp(best_date(repo)) >= cutoff]
     return filtered
+
+
+def fork_label(repo: GitHubRepo) -> tuple[str, str]:
+    """Repository column text and tooltip; forks show how far they are from the original."""
+    if not repo.is_fork:
+        return repo.full_name, repo.html_url
+    if repo.ahead_by is None:
+        return (
+            f"{repo.full_name} · fork",
+            "Fork — not compared with the original yet (or GitHub's rate limit was reached).\n"
+            f"{repo.html_url}",
+        )
+    text = f"{repo.full_name} · fork +{repo.ahead_by} / −{repo.behind_by or 0}"
+    tooltip = (
+        f"Fork of {repo.parent_full_name}: {repo.ahead_by} commit(s) ahead, "
+        f"{repo.behind_by or 0} behind.\n{repo.html_url}"
+    )
+    return text, tooltip
 
 
 def format_stars(stars: int) -> str:
@@ -354,6 +377,26 @@ class DiscoverTab(QWidget):
         filter_row.addStretch(1)
         layout.addLayout(filter_row)
 
+        fork_row = QHBoxLayout()
+        self.include_forks_check = QCheckBox("Include forks")
+        self.include_forks_check.setToolTip(
+            "Also search forks: copies of a project that someone else maintains.\n"
+            "GitHub hides them from search unless asked. Changing this searches again."
+        )
+        self.include_forks_check.toggled.connect(self._on_include_forks_changed)
+        fork_row.addWidget(self.include_forks_check)
+        fork_row.addSpacing(16)
+        self.forks_with_changes_check = QCheckBox("Only forks with changes")
+        self.forks_with_changes_check.setChecked(True)
+        self.forks_with_changes_check.setEnabled(False)
+        self.forks_with_changes_check.setToolTip(
+            "Hide forks that have no commits of their own (at least 1 commit ahead of the original)."
+        )
+        self.forks_with_changes_check.toggled.connect(self._on_filter_changed)
+        fork_row.addWidget(self.forks_with_changes_check)
+        fork_row.addStretch(1)
+        layout.addLayout(fork_row)
+
         self._stack = QStackedWidget()
         self._empty_label = QLabel()
         self._empty_label.setProperty("role", "subtle")
@@ -474,6 +517,7 @@ class DiscoverTab(QWidget):
             self._controller.search_github,
             query,
             self.sort_combo.currentData(),
+            self.include_forks_check.isChecked(),
             start_message=f"Searching GitHub for '{query}'...",
             on_result=partial(self._on_search_completed, generation, query),
             error_prefix="Search failed",
@@ -506,6 +550,15 @@ class DiscoverTab(QWidget):
         self.search_results = list(repos)
         self._populate(self._visible_after_filters())
         self._report_counts()
+        uncompared = sum(1 for r in repos if r.is_fork and r.ahead_by is None)
+        if uncompared:
+            message = (
+                f"{uncompared} fork(s) couldn't be compared with the original, so they are shown "
+                "unfiltered. GitHub's rate limit was probably reached; add a token in "
+                "Settings → GitHub to raise it."
+            )
+            self._host.set_status(message)
+            self._append_log(message)
 
     def _on_filter_changed(self, *_: object) -> None:
         """Re-apply the filters to the current results without a new search."""
@@ -513,6 +566,12 @@ class DiscoverTab(QWidget):
             return
         self._populate(self._visible_after_filters())
         self._report_counts()
+
+    def _on_include_forks_changed(self, checked: bool) -> None:
+        """Forks come from a different GitHub query, so search again."""
+        self.forks_with_changes_check.setEnabled(checked)
+        if self.search_input.text().strip():
+            self._search()
 
     def _on_sort_changed(self, *_: object) -> None:
         """'Recently updated' asks GitHub for activity order, so it searches again."""
@@ -532,6 +591,9 @@ class DiscoverTab(QWidget):
             self.search_results,
             windows_only=self.windows_only_check.isChecked(),
             inactive_days=self.inactive_days_spin.value() if self.hide_inactive_check.isChecked() else None,
+            forks_with_changes_only=(
+                self.include_forks_check.isChecked() and self.forks_with_changes_check.isChecked()
+            ),
         )
 
     def _hidden_suffix(self) -> str:
@@ -573,7 +635,8 @@ class DiscoverTab(QWidget):
         name = _cell(repo.name, tooltip=repo.html_url)
         name.setData(_ID_ROLE, repo.full_name)
         table.setItem(row, COL_NAME, name)
-        table.setItem(row, COL_REPO, _cell(repo.full_name, tooltip=repo.html_url))
+        repo_text, repo_tip = fork_label(repo)
+        table.setItem(row, COL_REPO, _cell(repo_text, tooltip=repo_tip))
 
         table.setItem(row, COL_STARS, _cell(
             format_stars(repo.stars),

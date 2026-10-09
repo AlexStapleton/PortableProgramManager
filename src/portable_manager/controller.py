@@ -94,38 +94,60 @@ class AppController:
         with self._lock:
             return self.github
 
-    def search_github(self, query: str, sort: str = "stars", progress_callback: ProgressCallback = None) -> list[GitHubRepo]:
+    def search_github(
+        self,
+        query: str,
+        sort: str = "stars",
+        include_forks: bool = False,
+        progress_callback: ProgressCallback = None,
+    ) -> list[GitHubRepo]:
         if progress_callback:
             progress_callback(10, f"Searching GitHub for '{query}'")
         with self._lock:
             limit = self.settings.search_result_limit
-        results = self._get_github().search_repositories(query, limit=limit, sort=sort)
+        results = self._get_github().search_repositories(
+            query, limit=limit, sort=sort, include_forks=include_forks
+        )
         if progress_callback:
             progress_callback(100, f"Loaded {len(results)} search results")
         return results
 
     def fetch_release_dates(self, repos: list[GitHubRepo], progress_callback: ProgressCallback = None) -> list[GitHubRepo]:
-        """Return copies of *repos* with latest-release date and Windows-asset flag filled in.
+        """Return copies of *repos* with release info filled in, plus ahead/behind counts for forks.
 
-        Lookups run in parallel. When the API rate limit is nearly used up, the
-        remaining repos are left unchecked rather than burning the last calls.
+        Lookups run in parallel. Each repo costs one API call and each fork two
+        more (fork vs. original comparison). When the rate limit is nearly used
+        up, the remaining repos are left unchecked rather than burning the last calls.
         """
         github = self._get_github()
         enriched = [dataclasses.replace(repo) for repo in repos]
         total = len(enriched)
-        budget = total
-        if github.rate_limit_remaining is not None:
-            budget = max(0, min(total, github.rate_limit_remaining - 5))
-        targets = enriched[:budget]
+        if github.rate_limit_remaining is None:
+            github.refresh_rate_limit()  # free; search results don't report the core quota
+        budget = None if github.rate_limit_remaining is None else max(0, github.rate_limit_remaining - 5)
+        targets: list[GitHubRepo] = []
+        for repo in enriched:
+            cost = 3 if repo.is_fork else 1
+            if budget is not None:
+                if cost > budget:
+                    continue
+                budget -= cost
+            targets.append(repo)
+
+        def _lookup(repo: GitHubRepo) -> None:
+            try:
+                repo.latest_release_at, repo.has_windows_release = github.get_latest_release_info(repo.full_name)
+            except Exception:
+                repo.latest_release_at, repo.has_windows_release = "", None
+            if repo.is_fork:
+                try:
+                    repo.parent_full_name, repo.ahead_by, repo.behind_by = github.compare_fork_with_parent(repo.full_name)
+                except Exception:
+                    log.info("Couldn't compare fork %s with its parent", repo.full_name, exc_info=True)
+
         done = 0
         with ThreadPoolExecutor(max_workers=_MAX_PARALLEL_REQUESTS) as pool:
-            futures = {pool.submit(github.get_latest_release_info, repo.full_name): repo for repo in targets}
-            for future in as_completed(futures):
-                repo = futures[future]
-                try:
-                    repo.latest_release_at, repo.has_windows_release = future.result()
-                except Exception:
-                    repo.latest_release_at, repo.has_windows_release = "", None
+            for _ in as_completed([pool.submit(_lookup, repo) for repo in targets]):
                 done += 1
                 if progress_callback:
                     progress_callback(int(done / max(total, 1) * 100), f"Fetching release info ({done}/{total})")

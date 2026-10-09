@@ -446,3 +446,55 @@ def test_invalid_full_name_is_rejected_before_any_request(monkeypatch, clock):
     finally:
         client.close()
     assert calls == []
+
+
+def test_search_with_forks_adds_qualifier_and_marks_forks(monkeypatch):
+    client = GitHubClient()
+    seen = {}
+
+    class _Resp:
+        status_code = 200
+        headers = {"X-RateLimit-Resource": "search"}
+        url = "https://api.github.com/search/repositories"
+
+        def json(self):
+            return {"items": [
+                {"full_name": "a/x", "name": "x", "owner": {"login": "a"}, "fork": False},
+                {"full_name": "b/x", "name": "x", "owner": {"login": "b"}, "fork": True},
+            ]}
+
+    def fake_request(method, url, **kw):
+        seen["q"] = kw["params"]["q"]
+        return _Resp()
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+    repos = client.search_repositories("SMUDebugTool", include_forks=True)
+    assert seen["q"] == "SMUDebugTool fork:true"
+    assert [r.is_fork for r in repos] == [False, True]
+    client.search_repositories("SMUDebugTool")
+    assert seen["q"] == "SMUDebugTool"
+
+
+def test_compare_fork_with_parent(monkeypatch):
+    client = GitHubClient()
+    urls = []
+
+    class _Resp:
+        def __init__(self, payload):
+            self.status_code = 200
+            self.headers = {}
+            self.url = ""
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake_request(method, url, **kw):
+        urls.append(url)
+        if url.endswith("/repos/AlexStapleton/SMUDebugTool"):
+            return _Resp({"default_branch": "master", "parent": {"full_name": "irusanov/SMUDebugTool", "default_branch": "master"}})
+        return _Resp({"ahead_by": 124, "behind_by": 4})
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+    assert client.compare_fork_with_parent("AlexStapleton/SMUDebugTool") == ("irusanov/SMUDebugTool", 124, 4)
+    assert urls[1].endswith("/repos/irusanov/SMUDebugTool/compare/master...AlexStapleton:SMUDebugTool:master")
