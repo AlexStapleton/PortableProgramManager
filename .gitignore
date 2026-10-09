@@ -8,6 +8,7 @@ venv/
 # PyInstaller output
 build/
 dist/
+*.spec.bak
 
 # Local tooling
 .claude/settings.local.json
