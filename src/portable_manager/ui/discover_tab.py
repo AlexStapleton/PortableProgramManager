@@ -467,7 +467,7 @@ class DiscoverTab(QWidget):
         row = QHBoxLayout()
         self.link_input = QLineEdit()
         self.link_input.setPlaceholderText(
-            "Paste a GitHub project link or a direct download link (.zip, .7z, .exe)"
+            "Paste a project link (GitHub, GitLab, Codeberg...) or a direct download link (.zip, .7z, .exe)"
         )
         self.link_input.setClearButtonEnabled(True)
         self.link_input.returnPressed.connect(self._install_from_link)

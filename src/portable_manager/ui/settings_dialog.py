@@ -245,7 +245,7 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self._build_general_page(settings), "General")
         self.tabs.addTab(self._build_updates_page(settings), "Updates")
         self.tabs.addTab(self._build_sources_page(), "Sources")
-        self.tabs.addTab(self._build_appearance_page(settings), "Appearance & tray")
+        self.tabs.addTab(self._build_appearance_page(settings), "Appearance && tray")
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         ok_button = buttons.button(QDialogButtonBox.Ok)

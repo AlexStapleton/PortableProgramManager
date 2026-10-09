@@ -188,7 +188,7 @@ def test_cache_refusal_rules(tmp_path):
 def test_settings_has_sources_tab_in_place_of_github(tmp_path):
     dialog = SettingsDialog(make_settings(tmp_path))
     tab_names = [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())]
-    assert tab_names == ["General", "Updates", "Sources", "Appearance & tray"]
+    assert tab_names == ["General", "Updates", "Sources", "Appearance && tray"]  # "&&" shows a literal "&"
 
 
 def test_describe_rate_limit_reports_valid_token():
