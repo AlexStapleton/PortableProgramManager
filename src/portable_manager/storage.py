@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, List
 
-from .credential_store import decrypt_token, encrypt_token
+from .credential_store import decrypt_token, encrypt_token, is_encrypted_token
 from .models import AppSettings, ManagedProgram
 
 log = logging.getLogger(__name__)
@@ -58,7 +58,12 @@ class Storage:
             # Decrypt the GitHub token (handles both DPAPI-encrypted and legacy plaintext).
             token = payload.get("github_token")
             payload["github_token"] = decrypt_token(token) if isinstance(token, str) and token else ""
-            return AppSettings.from_dict(payload)
+            settings = AppSettings.from_dict(payload)
+            if isinstance(token, str) and token and not is_encrypted_token(token):
+                # Written before tokens were encrypted: re-save so it's protected at rest.
+                log.info("Encrypting a GitHub token that was stored in plain text")
+                self.save_settings(settings)
+            return settings
         except (KeyError, TypeError, ValueError) as exc:
             # JSONDecodeError and UnicodeDecodeError are ValueError subclasses.
             # Corrupted settings file — back up the bad file and start fresh.

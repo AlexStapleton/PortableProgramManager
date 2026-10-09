@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import shutil
+import subprocess
 from pathlib import Path
 
 import requests
@@ -337,7 +338,12 @@ class SettingsDialog(QDialog):
         self.token_result.setWordWrap(True)
         self.github_token.textChanged.connect(self._clear_token_result)
         self.test_token_button = make_button("Test token", slot=self._test_token)
-        form.addRow("", hbox(self.test_token_button, self.token_result))
+        self.gh_cli_button = make_button("Use my GitHub CLI login", slot=self._import_gh_cli_token)
+        self.gh_cli_button.setToolTip(
+            "If you're signed in with the GitHub CLI (gh auth login), copy its token here."
+        )
+        self.gh_cli_button.setVisible(find_gh_cli() is not None)
+        form.addRow("", hbox(self.test_token_button, self.gh_cli_button, self.token_result))
         return page
 
     def _build_appearance_page(self, settings: AppSettings) -> QWidget:
@@ -425,6 +431,19 @@ class SettingsDialog(QDialog):
         self.token_result.setText(text)
         self.token_result.setStyleSheet(f"color: {status_color(kind).name()};")
 
+    def _import_gh_cli_token(self) -> None:
+        """Fill the token from ``gh auth token`` (the token itself is never shown or logged)."""
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            token, error = read_gh_cli_token()
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not token:
+            self._show_token_result(error, "error")
+            return
+        self.github_token.setText(token)
+        self._show_token_result("✓ Copied the token from your GitHub CLI login. Click OK to save it.", "ok")
+
     def _test_token(self) -> None:
         token = self.github_token.text().strip()
         headers = {"Accept": "application/vnd.github+json", "User-Agent": USER_AGENT}
@@ -486,3 +505,27 @@ class SettingsDialog(QDialog):
             close_to_tray=self.close_to_tray.isChecked(),
             theme=self.theme.currentData(),
         )
+
+
+def find_gh_cli() -> str | None:
+    """Path of the GitHub CLI (``gh``), or None if it isn't installed."""
+    return shutil.which("gh")
+
+
+def read_gh_cli_token() -> tuple[str, str]:
+    """Return ``(token, "")`` from ``gh auth token``, or ``("", error message)``."""
+    gh = find_gh_cli()
+    if not gh:
+        return "", "The GitHub CLI (gh) isn't installed."
+    try:
+        proc = subprocess.run(
+            [gh, "auth", "token", "--hostname", "github.com"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return "", f"Couldn't run the GitHub CLI: {exc}"
+    token = proc.stdout.strip()
+    if proc.returncode != 0 or not token:
+        return "", "The GitHub CLI isn't signed in. Run \"gh auth login\" first."
+    return token, ""
