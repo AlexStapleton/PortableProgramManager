@@ -281,6 +281,7 @@ class DiscoverTab(QWidget):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
+        root.setContentsMargins(20, 16, 20, 16)  # same as the Programs tab
         root.setSpacing(12)
 
         heading = QLabel("Discover")

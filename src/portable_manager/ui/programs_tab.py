@@ -290,7 +290,7 @@ class ProgramsTab(QWidget):
         self._splitter.setChildrenCollapsible(False)
         self._splitter.addWidget(self._table)
         self._splitter.addWidget(self._details)
-        self._splitter.setSizes([650, 350])
+        self._splitter.setSizes([560, 440])
 
         list_page = QWidget()
         list_layout = QVBoxLayout(list_page)
@@ -617,6 +617,12 @@ class ProgramsTab(QWidget):
             self._host.set_status(f"No update found for {program.name}.")
 
     def _check_all(self) -> None:
+        # The main window owns bulk checks so tray notifications fire the same way
+        # for button clicks, the toolbar and scheduled checks.
+        shared = getattr(self._host, "check_all_updates", None)
+        if callable(shared):
+            shared()
+            return
         self._host.start_task(
             self._controller.check_for_updates_all,
             start_message="Checking all managed programs for updates...",

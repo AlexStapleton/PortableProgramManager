@@ -136,6 +136,9 @@ class MainWindow(QMainWindow):
     def refresh_programs(self) -> None:
         self.programs_tab.refresh()
 
+    def check_all_updates(self) -> None:
+        self._check_all_program_updates()
+
     # Backwards-compatible names used by older code paths.
     _start_task = start_task
     _set_status = set_status

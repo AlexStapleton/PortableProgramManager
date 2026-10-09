@@ -225,7 +225,7 @@ QComboBox::down-arrow {
     width: 10px;
     height: 10px;
 }
-QComboBox:disabled::down-arrow {
+QComboBox::down-arrow:disabled {
     image: url("$arrow_disabled_png");
 }
 QComboBox QAbstractItemView {
