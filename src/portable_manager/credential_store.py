@@ -80,6 +80,11 @@ def encrypt_token(plaintext: str) -> str:
         return plaintext
 
 
+def is_encrypted_token(stored: str) -> bool:
+    """True if *stored* is a DPAPI-protected value written by :func:`encrypt_token`."""
+    return isinstance(stored, str) and stored.startswith(_DPAPI_PREFIX)
+
+
 def decrypt_token(stored: str) -> str:
     """Recover the plaintext token from a value previously returned by
     :func:`encrypt_token`.

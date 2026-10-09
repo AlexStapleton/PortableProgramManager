@@ -69,6 +69,7 @@ def main() -> int:
     app.aboutToQuit.connect(instance.release)
 
     controller = AppController(storage)
+    app.aboutToQuit.connect(controller.shutdown)
     window = MainWindow(controller)
     if is_elevated():
         window.setWindowTitle(window.windowTitle() + " (Administrator)")

@@ -14,6 +14,7 @@ from typing import Callable
 
 from . import fsops
 from .errors import AlreadyUpToDateError, InstallError, ProgramInUseError
+from .http_cache import ConditionalCache
 from .github_client import GitHubClient, GitHubRelease, GitHubReleaseAsset, GitHubRepo, parse_release_asset_url
 from .installer import PortableInstaller, normalize_dir
 from .launcher import PERMISSION_PROBLEM_MESSAGE, launch_program
@@ -78,16 +79,24 @@ class AppController:
         self.settings = storage.load_settings()
         self.programs = storage.load_programs()
         self._program_index: dict[str, ManagedProgram] = {p.program_id: p for p in self.programs}
-        self.github = GitHubClient(token=self.settings.github_token)
+        # Remembers API answers so unchanged ones cost no rate limit (see http_cache).
+        self.http_cache = ConditionalCache(storage.base_dir / "http_cache.json")
+        self.github = GitHubClient(token=self.settings.github_token, cache=self.http_cache)
         self.installer = PortableInstaller(self.settings, self.github)
         self._lock = RLock()
 
     def reload_clients(self) -> None:
         with self._lock:
             old = self.github
-            self.github = GitHubClient(token=self.settings.github_token)
+            self.github = GitHubClient(token=self.settings.github_token, cache=self.http_cache)
             self.installer = PortableInstaller(self.settings, self.github)
         old.close()
+
+    def shutdown(self) -> None:
+        """Flush caches and close network sessions when the app exits."""
+        self.http_cache.save(force=True)
+        with self._lock:
+            self.github.close()
 
     def _get_github(self) -> GitHubClient:
         """Return the shared GitHubClient, creating/replacing it only when the token changes."""
@@ -343,7 +352,7 @@ class AppController:
             self.settings = settings
             self.storage.save_settings(settings)
             old_github = self.github
-            self.github = GitHubClient(token=self.settings.github_token)
+            self.github = GitHubClient(token=self.settings.github_token, cache=self.http_cache)
             self.installer = PortableInstaller(self.settings, self.github)
             old_github.close()
             updated = False

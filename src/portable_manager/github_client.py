@@ -10,6 +10,7 @@ from urllib.parse import quote, unquote, urlparse, urlsplit
 import requests
 
 from . import __version__
+from .http_cache import ConditionalCache
 
 API_ROOT = "https://api.github.com"
 DEFAULT_TIMEOUT = 30
@@ -139,8 +140,11 @@ def _sha256_digest(value: object) -> str:
 
 
 class GitHubClient:
-    def __init__(self, token: str = "") -> None:
+    def __init__(self, token: str = "", cache: ConditionalCache | None = None) -> None:
         self.session = requests.Session()
+        # Conditional-request cache (shared across clients); None disables it.
+        self.cache = cache
+        self._cache_scope = token[-8:] if token else ""
         self.session.headers.update(
             {
                 "Accept": "application/vnd.github+json",
@@ -225,9 +229,19 @@ class GitHubClient:
         seconds; otherwise ``RateLimitError`` is raised without sleeping.
         """
         kwargs.setdefault("timeout", DEFAULT_TIMEOUT)
+        cache_key = cached = None
+        if method == "GET" and self.cache is not None:
+            cache_key = ConditionalCache.make_key(url, kwargs.get("params"), self._cache_scope)
+            cached = self.cache.get(cache_key)
+            if cached:
+                kwargs["headers"] = {**kwargs.get("headers", {}), "If-None-Match": cached["etag"]}
         for attempt in range(MAX_RETRIES + 1):
             response = self.session.request(method, url, **kwargs)
             self._record_rate_limit(response)
+            if response.status_code == 304 and cached:
+                return self._from_cache(response, cached)
+            if cache_key and response.status_code == 200 and response.headers.get("ETag"):
+                self.cache.put(cache_key, response.headers["ETag"], 200, response.content)
             if response.status_code not in (403, 429):
                 return response
 
@@ -249,6 +263,18 @@ class GitHubClient:
                 raise self._rate_limit_error(response, reset_at, now)
             time.sleep(wait)
         raise GitHubError("GitHub API request failed.")  # not reached: the last attempt always returns or raises
+
+    @staticmethod
+    def _from_cache(not_modified: requests.Response, cached: dict) -> requests.Response:
+        """Turn a 304 into the cached 200 response (keeping the fresh rate-limit headers)."""
+        response = requests.Response()
+        response.status_code = cached.get("status", 200)
+        response._content = cached["body"].encode("utf-8")
+        response.headers = not_modified.headers
+        response.url = not_modified.url
+        response.encoding = "utf-8"
+        response.request = not_modified.request
+        return response
 
     @staticmethod
     def _raise_for_status(response: requests.Response, what: str) -> None:
