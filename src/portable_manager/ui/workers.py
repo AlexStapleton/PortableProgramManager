@@ -6,11 +6,16 @@ from typing import Any, Callable
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 
 
+class TaskCancelled(Exception):
+    """Raised inside a task (from its progress callback) when the user cancels it."""
+
+
 class WorkerSignals(QObject):
     started = Signal()
     finished = Signal()
     result = Signal(object)
     error = Signal(str)
+    cancelled = Signal()
     progress = Signal(int, str)
 
 
@@ -22,14 +27,29 @@ class TaskWorker(QRunnable):
         self.kwargs = kwargs
         self.signals = WorkerSignals()
         self.setAutoDelete(True)
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        """Ask the task to stop at its next progress report (downloads report every chunk)."""
+        self._cancel_requested = True
+
+    def _report_progress(self, value: int, message: str) -> None:
+        if self._cancel_requested:
+            raise TaskCancelled()
+        self.signals.progress.emit(value, message)
 
     def run(self) -> None:
         self.signals.started.emit()
         try:
-            self.kwargs["progress_callback"] = self.signals.progress.emit
+            self.kwargs["progress_callback"] = self._report_progress
             result = self.fn(*self.args, **self.kwargs)
+        except TaskCancelled:
+            self.signals.cancelled.emit()
         except Exception as exc:  # pragma: no cover - signal boundary
-            self.signals.error.emit(_sanitize_error(exc))
+            if self._cancel_requested and isinstance(exc.__context__, TaskCancelled):
+                self.signals.cancelled.emit()
+            else:
+                self.signals.error.emit(_sanitize_error(exc))
         else:
             self.signals.result.emit(result)
         finally:
