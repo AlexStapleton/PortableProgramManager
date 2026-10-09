@@ -226,6 +226,8 @@ class AppSettings:
     show_system_notifications: bool = True
     minimize_to_tray: bool = True
     close_to_tray: bool = True
+    # "system" follows Windows light/dark mode; "light" or "dark" force one.
+    theme: str = "system"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -237,4 +239,9 @@ class AppSettings:
             values["default_update_interval_hours"] = _default_of(cls, "default_update_interval_hours")
         # Keep the result list within the range the search UI supports.
         values["search_result_limit"] = min(max(values["search_result_limit"], 5), 50)
+        if values["theme"] not in THEME_MODES:
+            values["theme"] = "system"
         return cls(**values)
+
+
+THEME_MODES = ("system", "light", "dark")

@@ -69,3 +69,40 @@ QLabel[role='subtle'] {
     color: #94a3b8;
 }
 """
+
+# ---------------------------------------------------------------------------
+# Public theme API used by the tabs and dialogs.
+#
+# Conventions widgets rely on:
+# - Buttons: ``button.setProperty("variant", "primary" | "secondary" | "danger")``.
+# - Labels: ``setProperty("role", "heading" | "subtle" | "empty-title")``.
+# - Colours for status text come from :func:`status_color`, never hard-coded,
+#   so they stay readable in both light and dark mode.
+# ---------------------------------------------------------------------------
+
+from PySide6.QtGui import QColor, QGuiApplication, QPalette
+
+# kind -> (light-mode colour, dark-mode colour)
+_STATUS_COLORS = {
+    "ok": ("#15803d", "#4ade80"),
+    "update": ("#1d4ed8", "#60a5fa"),
+    "error": ("#b91c1c", "#f87171"),
+    "warning": ("#b45309", "#fbbf24"),
+    "muted": ("#6b7280", "#94a3b8"),
+    "running": ("#7e22ce", "#c084fc"),
+    "accent": ("#2563eb", "#3b82f6"),
+}
+
+
+def is_dark() -> bool:
+    """True when the active palette is dark."""
+    app = QGuiApplication.instance()
+    if app is None:
+        return True
+    return app.palette().color(QPalette.ColorRole.Window).lightness() < 128
+
+
+def status_color(kind: str) -> QColor:
+    """Colour for a status *kind*: ok, update, error, warning, muted, running, accent."""
+    light, dark = _STATUS_COLORS.get(kind, _STATUS_COLORS["muted"])
+    return QColor(dark if is_dark() else light)

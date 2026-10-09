@@ -129,6 +129,33 @@ def find_running_processes(folder: Path) -> list[str]:
     return found
 
 
+def running_programs_by_folder(folders: Iterable[Path | str]) -> dict[str, list[str]]:
+    """One process scan for many folders: ``{normalised folder: ["name (pid)", ...]}``.
+
+    Only folders with at least one running process appear in the result.
+    Keys use :func:`os.path.normcase` + ``abspath`` (same as ``installer.normalize_dir``).
+    """
+    try:
+        import psutil
+    except ImportError:  # pragma: no cover - psutil is a declared dependency
+        return {}
+    wanted = {_norm(f) for f in folders}
+    if not wanted:
+        return {}
+    found: dict[str, list[str]] = {}
+    for proc in psutil.process_iter(["pid", "name", "exe"]):
+        try:
+            exe = proc.info.get("exe")
+        except (psutil.Error, OSError):
+            continue
+        if not exe:
+            continue
+        for folder in wanted:
+            if is_within(exe, folder):
+                found.setdefault(folder, []).append(f"{proc.info.get('name') or Path(exe).name} ({proc.info['pid']})")
+    return found
+
+
 def in_use_message(action: str, program_name: str, processes: list[str]) -> str:
     if processes:
         listed = ", ".join(processes[:5]) + (" …" if len(processes) > 5 else "")
