@@ -489,11 +489,17 @@ class SettingsDialog(QDialog):
         self.accept()
 
     def get_settings(self) -> AppSettings:
+        token = self.github_token.text().strip()
+        # The GitHub source owns the token; github_token mirrors it.
+        sources = [
+            dataclasses.replace(s, token=token) if s.id == "github" else s for s in self._base.sources
+        ]
         return dataclasses.replace(
             self._base,
+            sources=sources,
             install_root=self.install_root.text().strip(),
             download_cache=self.download_cache.text().strip(),
-            github_token=self.github_token.text().strip(),
+            github_token=token,
             auto_open_folder_after_install=self.auto_open_folder.isChecked(),
             search_result_limit=self.search_result_limit.value(),
             default_update_mode=self.default_update_mode.currentData(),

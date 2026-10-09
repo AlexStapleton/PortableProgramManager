@@ -91,6 +91,8 @@ def test_plaintext_token_is_encrypted_on_load(tmp_storage, tmp_path):
 
     loaded = tmp_storage.load_settings()
     assert loaded.github_token == "ghp_legacyplaintexttoken1234567890"
-    on_disk = json.loads(tmp_storage.settings_path.read_text(encoding="utf-8"))["github_token"]
+    saved = json.loads(tmp_storage.settings_path.read_text(encoding="utf-8"))
+    assert saved["github_token"] == ""  # moved onto the GitHub source
+    on_disk = next(src["token"] for src in saved["sources"] if src["id"] == "github")
     if os.name == "nt":
         assert on_disk.startswith("dpapi:") and "legacyplaintext" not in on_disk
