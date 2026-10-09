@@ -31,6 +31,96 @@ Severity: 🔴 High · 🟠 Medium · 🟡 Low
 
 ---
 
+## Resolution status (v0.8.0)
+
+All 82 findings were addressed across four pull requests. Each PR has its own tests, and each is stacked on the one before it.
+
+| PR | Scope |
+|---|---|
+| [#1](https://github.com/AlexStapleton/PortableProgramManager/pull/1) | Phase 1: permissions and the file-handling core |
+| [#2](https://github.com/AlexStapleton/PortableProgramManager/pull/2) | Phase 2: update correctness, update modes, GitHub client, permission repair |
+| [#3](https://github.com/AlexStapleton/PortableProgramManager/pull/3) | Phase 3: UI refresh |
+| #4 | Phase 4: build, CI, docs and the remaining hygiene items |
+
+### Root cause found during implementation: A12 🔴 installed files unreadable by the user's own account **[Confirmed]**
+v0.7 extracted archives through `tempfile.mkdtemp()`. Since Python 3.13 that folder gets a **protected ACL** on Windows: Owner Rights, SYSTEM and Administrators only, with inheritance blocked. Files moved out of it keep that ACL. When the manager ran as administrator, the owner was the Administrators group, so the user's normal account lost all access to the program's files. That broke launching, updating and removing it.
+
+On this machine every file of `OpenROM` was affected. This is very likely the "permissions" problem reported before the review.
+
+- **Fix:** staging folders are now created with a plain `mkdir` (#1).
+- **Repair:** the app detects affected programs at startup and offers **Repair permissions** (#2). The repair resets ACLs to inherit, and elevates via UAC only when ownership has to be taken back.
+
+### Per-finding status
+✅ = fixed · 📝 = deliberate decision, documented
+
+| Area | Finding → resolution | PR |
+|---|---|---|
+| A1 | ✅ Launch via ShellExecute (`os.startfile`), so `requireAdministrator` apps get a UAC prompt | #1 |
+| A2 | ✅ `.ps1` runs through `powershell.exe -File` when elevated too | #1 |
+| A3 | ✅ Launch arguments passed through verbatim | #1 |
+| A4 | ✅ Launch runs in a worker; the UAC prompt no longer freezes the UI | #1 |
+| A5 | ✅ Staged, file-by-file merge with backup and rollback; refuses while the program is running | #1 |
+| A6 | ✅ Rename-to-trash first, then registry, then delete (read-only aware, off the UI thread) | #1 |
+| A7 | ✅ Unsafe-delete guard and unique install folders per program | #1 |
+| A8 | ✅ Write-access check before installing and in Settings | #1, #3 |
+| A9 | ✅ Antivirus and permission problems explained on launch | #1, #2 |
+| A10 | ✅ `icacls` hardening removed (DPAPI protects the token); 7-Zip runs without a console window | #1 |
+| A11 | ✅ "(Administrator)" shown in the title bar when elevated | #1 |
+| A12 | ✅ See above | #1, #2 |
+| B1, B2 | ✅ Updates extract and flatten in staging, then merge; launch file chosen from the new content; user files kept | #1 |
+| B3 | ✅ Non-Windows and wrong-architecture assets dropped; "no Windows build" reported instead | #2 |
+| B4 | ✅ Every download gets its own cache folder and is always cleaned up; Settings has Clear cache | #1, #3 |
+| B5 | ✅ `/releases/download/` links install the exact asset | #2 |
+| B6 | ✅ Closing with close-to-tray off really quits; tray availability checked | #1 |
+| B7 | ✅ Token redaction only matches real header values and token shapes | #1 |
+| B8 | ✅ Blank launch file asks first; Browse and validation added | #3 |
+| B9 | ✅ Version recorded from the release URL's tag | #2 |
+| B10 | ✅ An identical download marks the program current | #2 |
+| B11 | ✅ The update timer follows the setting live; clearer label | #3 |
+| B12 | ✅ All four update modes implemented, with friendly labels | #2, #3 |
+| B13 | ✅ Exe ranking: helpers last, name hints, size; updates keep the previous launch file | #2 |
+| B14 | ✅ Token-based installer detection (Updater/uninstall no longer count) | #2 |
+| B15, B16 | ✅ Rate limits fail fast; a plain 403 isn't retried; quota-aware enrichment | #2 |
+| B17 | ✅ Search generation guard; enrichment works on copies | #2, #3 |
+| B18 | ✅ Widgets lock when a task is submitted | #1 |
+| B19 | ✅ Reinstall keeps customisations and asks first | #2, #3 |
+| B20 | ✅ Controller hands copies to the UI; updates commit from a snapshot | #1 |
+| B21 | ✅ Background check errors are logged, not shown as dialogs | #3 |
+| B22 | ✅ Quitting mid-task asks first | #1 |
+| B23 | ✅ Type-safe `from_dict` coercion for every field | #1 |
+| B24 | ✅ Content-Length check skipped for encoded responses | #1 |
+| B25 | ✅ Superseded single-file exes removed after an update | #1 |
+| B26 | ✅ `.7z` extracts into staging; 7-Zip preferred over py7zr | #1 |
+| B27 | ✅ Download session closed and sends the app's User-Agent | #1 |
+| C1 | ✅ Bad entries skipped and saved to `programs.rejected-*.json`; rolling `programs.json.bak` | #1 |
+| C2 | ✅ Single-instance guard; a second launch brings the window forward | #1 |
+| C3 | ✅ Timestamped corrupt backups, never overwritten | #1 |
+| C4 | ✅ Rotating `app.log` plus uncaught-exception logging | #1 |
+| D1, D2 | ✅ Parallel release lookups and update checks; one registry save per batch | #2 |
+| D3, D5 | ✅ Remove and launch run in workers; no lock held during deletion | #1 |
+| D4 | ✅ Update install fetches the release once | #2 |
+| D6 | ✅ UPX disabled (antivirus false positives, slow start-up); version resource added | #4 |
+| D7 | ✅ Table is now a model/view with cached icons and folder checks | #3 |
+| D8 | 📝 `fsync` kept for registry integrity; the cost is now paid once per batch (D2) instead of per program | #2 |
+| D9 | ✅ `py7zr` imported lazily | #1 |
+| D10 | ✅ Old `GitHubClient` sessions closed | #1 |
+| D11 | ✅ Window icon set once | #1 |
+| D12 | 📝 The installer-detection pass still walks the folder once more after install; it runs only on install and costs milliseconds | — |
+| E1–E16 | ✅ Theme that follows Windows (with dark title bar), new Programs/Discover tabs, dialogs, tray launcher, shortcuts, remembered layout, empty states, running-state detection | #3 |
+| F1 | ✅ Downloads verified against GitHub's published SHA-256 | #2 |
+| F2 | ✅ Removed `_quote_args_for_shell` | #1 |
+| F3 | 📝 Arguments to `.bat` files are interpreted by `cmd.exe`; acceptable because only the user enters them | — |
+| F4 | 📝 Mark-of-the-Web is not written; SmartScreen prompts on every launch of a managed portable app would defeat the purpose. Downloads are HTTPS-only and digest-verified instead | — |
+| G1 | ✅ pytest suite (360+ tests) and a GitHub Actions workflow | #1–#4 |
+| G2, G3 | ✅ README rewritten with build/run/troubleshooting; stale `main.spec` and `Install Instructions.txt` removed | #4 |
+| G4 | ✅ `psutil` declared; dev requirements; version bounds | #1, #4 |
+| G5 | ✅ `__version__` (0.8.0) used for the User-Agent, the About dialog and the exe version resource | #1, #4 |
+| G6 | ✅ Duplicate root icon removed | #4 |
+| G7 | ✅ Design doc changelog updated for v0.8 | #4 |
+| G8 | ✅ `.gitignore` covers build output, venvs, caches and agent worktrees | #1 |
+
+---
+
 ## A. Permissions & managing installed programs
 
 ### 🔴 A1. Programs that need admin fail with WinError 740 **[Confirmed]**

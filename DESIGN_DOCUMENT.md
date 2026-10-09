@@ -6,10 +6,18 @@
 - Language: Python
 - UI stack: PySide6 (Qt Widgets)
 - Current implementation status: functional MVP with due-check scheduler, edit-program dialog, threaded background jobs, run-as-admin, .7z extraction, ZIP Slip protection, missing-folder detection, and remove-with-delete
-- Last updated: 2026-03-04
+- Last updated: 2026-10-09 (v0.8)
 - Last code review: 2026-03-03 (see §15)
 
 ## Changelog
+- v0.8 (2026-10-09) — implements all 82 findings of `docs/CODE_REVIEW.md` (see its "Resolution status" section for the per-finding record). Highlights:
+  - **Architecture:** new modules `fsops.py` (staging, transactional merge with rollback, safe delete, permission detection/repair), `launcher.py` (ShellExecute-based launching), `errors.py`, `logging_setup.py`, `single_instance.py`, `winutil.py`; the UI is split into `ui/programs_tab.py`, `ui/programs_model.py`, `ui/details_view.py`, `ui/discover_tab.py`, `ui/theme.py` and a thin `ui/main_window.py` shell (`ui/host.py` defines the contract between them).
+  - **Launch:** `os.startfile` (ShellExecuteEx) replaces `subprocess`/`ShellExecuteW`, so `requireAdministrator` programs get a UAC prompt; launch arguments are passed verbatim; `.ps1` runs via `powershell.exe -ExecutionPolicy RemoteSigned -File` (this supersedes the v0.7 notes about `Bypass` and per-token quoting).
+  - **Install/update:** extraction always happens in a hidden staging folder next to the install folder, then `fsops.apply_staged_tree` merges file by file with backups and rollback. Removal renames the folder aside before deleting, so it fails cleanly when files are in use (this supersedes the v0.7 note that `rmtree` runs outside the lock).
+  - **Permissions:** v0.7 staged extractions with `tempfile.mkdtemp()`, whose protected ACL (Python 3.13+) leaked into installed files; v0.8 detects and repairs those installs.
+  - **Updates:** all four update modes implemented; parallel checks with one registry save; SHA-256 verification against GitHub's published asset digest.
+  - **UI:** theme follows Windows light/dark; model/view Programs table with icons, status colours, context menu, shortcuts and running-state detection; tray quick-launch menu; cancellable downloads.
+  - **Quality:** pytest suite (360+ tests) and a GitHub Actions workflow.
 - v0.7:
   - Added **Remove and delete files** option: the remove-program dialog now has three buttons — "Remove only", "Remove and delete files", and Cancel. `controller.remove_program(delete_files=bool)` calls `shutil.rmtree` outside the lock after removing the registry entry.
   - Added **Stable / Pre-release channel selector** in the Discover tab. A `QComboBox` next to the Install button lets the user choose the GitHub release channel before installing. The channel is stored on `UpdatePolicy.channel` so future update checks use the same channel.

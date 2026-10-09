@@ -192,3 +192,38 @@ def test_identical_update_raises_already_up_to_date(installer, tmp_path, monkeyp
             GitHubRelease(1, "v2", "v2", "", "", False, []),
             GitHubReleaseAsset("Tool.exe", "https://x/Tool.exe", 4, ""),
         )
+
+
+def test_cancelling_a_download_cleans_up(installer, monkeypatch):
+    """The worker's progress callback raises TaskCancelled; the partial download must vanish."""
+    from portable_manager.ui.workers import TaskCancelled
+
+    class _Resp:
+        url = "https://example.test/a.zip"
+        headers = {"Content-Length": str(1024 * 1024)}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size):
+            for _ in range(4):
+                yield b"x" * (256 * 1024)
+
+    monkeypatch.setattr("requests.Session.get", lambda self, *a, **k: _Resp())
+    calls = []
+
+    def progress(value, message):
+        calls.append(value)
+        if len(calls) > 2:
+            raise TaskCancelled()
+
+    with pytest.raises(TaskCancelled):
+        installer._download("https://example.test/a.zip", "a.zip", progress_callback=progress)
+    cache = Path(installer.settings.download_cache)
+    assert not any(cache.rglob("a.zip"))

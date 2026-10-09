@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QProgressBar,
+    QPushButton,
     QSizePolicy,
     QStatusBar,
     QStyle,
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import __version__
 from ..controller import AppController, UpdateCheckReport
 from . import theme
 from .discover_tab import DiscoverTab
@@ -99,6 +101,7 @@ class MainWindow(QMainWindow):
         lock_widgets: list[QWidget] | None = None,
         silent_errors: bool = False,
     ) -> None:
+        """Run *fn* in the background. Visible tasks can be cancelled from the status bar."""
         worker = TaskWorker(fn, *args)
         # Keep a Python reference so the GC cannot collect worker/worker.signals
         # while Qt's thread pool still holds the C++ QRunnable pointer.
@@ -119,8 +122,19 @@ class MainWindow(QMainWindow):
             worker.signals.error.connect(partial(self._log_task_error, error_prefix))
         else:
             worker.signals.error.connect(partial(self._on_task_error, error_prefix))
+        worker.signals.cancelled.connect(lambda: self.set_status("Cancelled. Nothing was changed."))
         worker.signals.finished.connect(partial(self._on_task_finished, locked, worker))
+        if not silent_errors:
+            self._cancellable.append(worker)
+            self.cancel_button.setEnabled(True)
+            self.cancel_button.setVisible(True)
         self.runner.start(worker)
+
+    def _cancel_tasks(self) -> None:
+        for worker in self._cancellable:
+            worker.cancel()
+        self.cancel_button.setEnabled(False)
+        self.set_status("Cancelling...")
 
     def set_status(self, message: str) -> None:
         self.status.showMessage(message, 10_000)
@@ -157,6 +171,12 @@ class MainWindow(QMainWindow):
         self.progress_bar.setFixedWidth(220)
         self.progress_bar.setVisible(False)
         self.status.addPermanentWidget(self.progress_bar)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setToolTip("Stop the running download or install")
+        self.cancel_button.setVisible(False)
+        self.cancel_button.clicked.connect(self._cancel_tasks)
+        self.status.addPermanentWidget(self.cancel_button)
+        self._cancellable: list[TaskWorker] = []
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Main toolbar")
@@ -183,6 +203,10 @@ class MainWindow(QMainWindow):
         settings_action.setToolTip("Settings (Ctrl+,)")
         settings_action.triggered.connect(self._open_settings)
         toolbar.addAction(settings_action)
+
+        about_action = QAction(style.standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation), "About", self)
+        about_action.triggered.connect(self._show_about)
+        toolbar.addAction(about_action)
 
     def _build_shortcuts(self) -> None:
         QShortcut(QKeySequence("Ctrl+,"), self, activated=self._open_settings)
@@ -358,6 +382,28 @@ class MainWindow(QMainWindow):
         self.refresh_programs()
         self.set_status("Settings saved.")
 
+    def _show_about(self) -> None:
+        data_dir = self.controller.storage.base_dir
+        box = QMessageBox(self)
+        box.setWindowTitle("About Portable Program Manager")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(
+            f"<b>Portable Program Manager {__version__}</b><br>"
+            "Install, launch and update portable Windows programs from GitHub.<br><br>"
+            '<a href="https://github.com/AlexStapleton/PortableProgramManager">'
+            "github.com/AlexStapleton/PortableProgramManager</a><br>"
+            "Licensed under the GPL-3.0."
+        )
+        box.setInformativeText(f"Settings, program list and log file:\n{data_dir}")
+        open_logs = box.addButton("Open log folder", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+        if box.clickedButton() is open_logs:
+            try:
+                os.startfile(str(data_dir))
+            except OSError as exc:
+                self.warn(f"Could not open folder: {exc}")
+
     def _open_install_root(self) -> None:
         path = self.controller.settings.install_root
         if not Path(path).is_dir():
@@ -391,6 +437,10 @@ class MainWindow(QMainWindow):
             self._workers.remove(worker)
         except ValueError:
             pass  # already removed (duplicate finished signal)
+        if worker in self._cancellable:
+            self._cancellable.remove(worker)
+        if not self._cancellable:
+            self.cancel_button.setVisible(False)
         self._active_jobs = max(0, self._active_jobs - 1)
         for widget in lock_widgets:
             widget.setEnabled(True)

@@ -3,6 +3,8 @@
 **Date:** 2026-04-07
 **Version Analyzed:** v0.7
 
+> **Update 2026-10-09 (v0.8):** every finding below marked TODO has been resolved; see the per-finding record in [`docs/CODE_REVIEW.md`](docs/CODE_REVIEW.md#resolution-status-v080) (P1–P3 → D1/D2, P4 → D3, P5 → D4, P6 → D5, P7/P13 → D7, P8/P9 → D8 (kept; now once per batch), P10 → B20, P11 → B27, P12 → kept, P14 → D11, P15 → D9, P16 → D10). S2 and S9 were revised: arguments are now passed verbatim through ShellExecute (the per-token quoting changed program behaviour without adding protection).
+
 ---
 
 ## Security Findings (16 issues)

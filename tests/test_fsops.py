@@ -200,6 +200,13 @@ def test_permission_problem_detected_and_repaired_without_elevation(tmp_path):
     """Reproduces the v0.7 damage (protected ACL without the user) on a folder we own."""
     import subprocess
 
+    from portable_manager.winutil import is_elevated
+
+    if is_elevated():
+        # Administrators can still read the folder, so there is no lock-out to
+        # detect (CI runners are elevated). The damage only affects normal accounts.
+        pytest.skip("running elevated")
+
     folder = tmp_path / "App"
     _write(folder / "ok.txt", "fine")
     locked_dir = folder / "data"
