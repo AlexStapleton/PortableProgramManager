@@ -1,26 +1,17 @@
 from __future__ import annotations
 
 import pytest
-import shiboken6
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import QApplication
 
 from portable_manager.ui import theme
 
 
-@pytest.fixture
-def qapp():
-    app = QApplication.instance()
-    if app is not None and not isinstance(app, QApplication):
-        # test_single_instance leaves a bare QCoreApplication behind; theming needs
-        # widgets, so replace it with a real QApplication.
-        shiboken6.delete(app)
-        app = None
-    if app is None:
-        app = QApplication([])
-    yield app
+@pytest.fixture(autouse=True)
+def _restore_light(qapp):
+    yield
     # Leave a known mode behind so other tests are unaffected.
-    theme.apply_theme(app, "light")
+    theme.apply_theme(qapp, "light")
 
 
 def test_light_mode_applies_light_palette_and_stylesheet(qapp):

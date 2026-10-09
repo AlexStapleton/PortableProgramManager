@@ -14,3 +14,11 @@ def tmp_storage(tmp_path):
     from portable_manager.storage import Storage
 
     return Storage(base_dir=tmp_path / "appdata")
+
+
+@pytest.fixture(scope="session")
+def qapp():
+    """One QApplication for the whole test session (widgets need QApplication, not QCoreApplication)."""
+    from PySide6.QtWidgets import QApplication
+
+    return QApplication.instance() or QApplication([])

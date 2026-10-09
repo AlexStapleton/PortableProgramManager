@@ -14,11 +14,6 @@ from PySide6.QtCore import QCoreApplication
 from portable_manager.single_instance import SingleInstance, default_instance_key
 
 
-@pytest.fixture(scope="module")
-def qapp():
-    return QCoreApplication.instance() or QCoreApplication([])
-
-
 @pytest.fixture
 def key():
     return f"ppm-test-{uuid.uuid4().hex}"
