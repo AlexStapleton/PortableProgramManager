@@ -3,14 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-import requests
-from PySide6.QtWidgets import QApplication, QDialog, QLineEdit, QMessageBox
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from portable_manager import fsops
 from portable_manager.errors import InstallError
 from portable_manager.models import AppSettings, ManagedProgram, UpdatePolicy
 from portable_manager.ui.edit_program_dialog import EditProgramDialog
-from portable_manager.ui.settings_dialog import SettingsDialog, cache_refusal
+from portable_manager.ui.settings_dialog import SettingsDialog, cache_refusal, describe_rate_limit
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -186,50 +185,28 @@ def test_cache_refusal_rules(tmp_path):
     assert cache_refusal(str(tmp_path / "cache"), str(tmp_path / "installs")) is None
 
 
-def test_token_test_reports_valid_token(tmp_path, monkeypatch):
-    seen: dict = {}
-
-    def fake_get(url, headers=None, timeout=None):
-        seen.update(url=url, headers=headers, timeout=timeout)
-        return FakeResponse(200, rate_limit_payload(4998, 5000))
-
-    monkeypatch.setattr(requests, "get", fake_get)
+def test_settings_has_sources_tab_in_place_of_github(tmp_path):
     dialog = SettingsDialog(make_settings(tmp_path))
-    dialog.github_token.setText("ghp_example")
-    dialog.test_token_button.click()
-
-    assert dialog.token_result.text() == "✓ Valid — 4,998 of 5,000 requests left this hour"
-    assert seen["url"].endswith("/rate_limit")
-    assert seen["headers"]["Authorization"] == "Bearer ghp_example"
-    assert "ghp_example" not in dialog.token_result.text()
+    tab_names = [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())]
+    assert tab_names == ["General", "Updates", "Sources", "Appearance & tray"]
 
 
-def test_token_test_reports_rejected_token(tmp_path, monkeypatch):
-    monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse(401))
-    dialog = SettingsDialog(make_settings(tmp_path))
-    dialog.test_token_button.click()
-
-    assert dialog.token_result.text() == "✗ GitHub rejected this token (HTTP 401)."
+def test_describe_rate_limit_reports_valid_token():
+    message, kind = describe_rate_limit(FakeResponse(200, rate_limit_payload(4998, 5000)), has_token=True)
+    assert message == "✓ Valid — 4,998 of 5,000 requests left this hour"
+    assert kind == "ok"
 
 
-def test_token_test_reports_network_failure(tmp_path, monkeypatch):
-    def offline(*args, **kwargs):
-        raise requests.ConnectionError("no route to host")
-
-    monkeypatch.setattr(requests, "get", offline)
-    dialog = SettingsDialog(make_settings(tmp_path))
-    dialog.test_token_button.click()
-
-    assert dialog.token_result.text().startswith("Couldn't reach GitHub")
+def test_describe_rate_limit_reports_rejected_token():
+    message, kind = describe_rate_limit(FakeResponse(401), has_token=True)
+    assert message == "✗ GitHub rejected this token (HTTP 401)."
+    assert kind == "error"
 
 
-def test_token_show_toggle(tmp_path):
-    dialog = SettingsDialog(make_settings(tmp_path))
-    assert dialog.github_token.echoMode() == QLineEdit.EchoMode.Password
-    dialog.show_token.setChecked(True)
-    assert dialog.github_token.echoMode() == QLineEdit.EchoMode.Normal
-    dialog.show_token.setChecked(False)
-    assert dialog.github_token.echoMode() == QLineEdit.EchoMode.Password
+def test_describe_rate_limit_without_token_is_muted():
+    message, kind = describe_rate_limit(FakeResponse(200, rate_limit_payload(60, 60)), has_token=False)
+    assert message == "No token entered. Without one, 60 of 60 requests left this hour."
+    assert kind == "muted"
 
 
 # ----------------------------------------------------------------------
