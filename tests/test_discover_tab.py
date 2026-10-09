@@ -19,6 +19,7 @@ from portable_manager.ui.discover_tab import (
     COL_STARS,
     DiscoverTab,
     _EMPTY_TEXT,
+    apply_filters,
     format_stars,
 )
 
@@ -75,6 +76,7 @@ class FakeController:
         self.settings = SimpleNamespace(auto_open_folder_after_install=False)
         self.github = GitHubClient(token="")       # real URL parsing, no network calls are made
         self.search_calls: list[tuple[str, str]] = []
+        self.include_forks_calls: list[bool] = []
         self.install_repo_calls: list[tuple[str, str]] = []
         self.install_url_calls: list[str] = []
         self.run_calls: list[str] = []
@@ -82,8 +84,9 @@ class FakeController:
     def close(self) -> None:
         self.github.close()
 
-    def search_github(self, query, sort="stars", progress_callback=None):
+    def search_github(self, query, sort="stars", include_forks=False, progress_callback=None):
         self.search_calls.append((query, sort))
+        self.include_forks_calls.append(include_forks)
         return list(self.results_by_query.get(query, []))
 
     def fetch_release_dates(self, repos, progress_callback=None):
@@ -539,3 +542,49 @@ def test_context_menu_copies_repository_url(tab, controller):
     select(tab, "notes")
     tab._copy_repo_url(NOTES)
     assert QApplication.clipboard().text() == "https://github.com/acme/notes"
+
+
+# ---------------------------------------------------------------------------
+# Fork filters
+# ---------------------------------------------------------------------------
+
+def _fork(full_name: str, stars: int, ahead: int | None, behind: int = 0) -> GitHubRepo:
+    repo = make_repo(full_name, stars)
+    repo.is_fork = True
+    repo.parent_full_name = "irusanov/SMUDebugTool" if ahead is not None else ""
+    repo.ahead_by = ahead
+    repo.behind_by = behind if ahead is not None else None
+    return repo
+
+
+def test_forks_with_changes_filter_hides_unchanged_forks():
+    parent = make_repo("irusanov/SMUDebugTool", 485)
+    mine = _fork("AlexStapleton/SMUDebugTool", 2, ahead=124, behind=4)
+    stale = _fork("Coldblackice/SMUDebugTool", 0, ahead=0, behind=13)
+    pending = _fork("someone/SMUDebugTool", 0, ahead=None)
+    repos = [parent, mine, stale, pending]
+    shown = apply_filters(repos, windows_only=False, inactive_days=None, forks_with_changes_only=True)
+    assert [r.full_name for r in shown] == ["irusanov/SMUDebugTool", "AlexStapleton/SMUDebugTool", "someone/SMUDebugTool"]
+    everything = apply_filters(repos, windows_only=False, inactive_days=None, forks_with_changes_only=False)
+    assert len(everything) == 4
+
+
+def test_fork_label_shows_ahead_and_behind():
+    from portable_manager.ui.discover_tab import fork_label
+
+    text, tip = fork_label(_fork("AlexStapleton/SMUDebugTool", 2, ahead=124, behind=4))
+    assert text == "AlexStapleton/SMUDebugTool · fork +124 / −4"
+    assert "Fork of irusanov/SMUDebugTool" in tip
+    assert fork_label(make_repo("irusanov/SMUDebugTool", 485))[0] == "irusanov/SMUDebugTool"
+
+
+def test_include_forks_checkbox_searches_again_with_forks(tab, controller):
+    controller.results_by_query["SMUDebugTool"] = [make_repo("irusanov/SMUDebugTool", 485)]
+    tab.search_input.setText("SMUDebugTool")
+    assert not tab.forks_with_changes_check.isEnabled()
+    tab.include_forks_check.setChecked(True)
+    assert controller.include_forks_calls[-1] is True
+    assert tab.forks_with_changes_check.isEnabled()
+    tab.include_forks_check.setChecked(False)
+    assert controller.include_forks_calls[-1] is False
+    assert not tab.forks_with_changes_check.isEnabled()

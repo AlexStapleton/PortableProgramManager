@@ -5,7 +5,7 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Optional
-from urllib.parse import unquote, urlparse, urlsplit
+from urllib.parse import quote, unquote, urlparse, urlsplit
 
 import requests
 
@@ -78,6 +78,11 @@ class GitHubRepo:
     pushed_at: str = ""
     latest_release_at: str = ""
     has_windows_release: bool | None = None  # None = not yet checked
+    is_fork: bool = False
+    # Filled in for forks by GitHubClient.compare_fork_with_parent (None = not yet checked).
+    parent_full_name: str = ""
+    ahead_by: int | None = None
+    behind_by: int | None = None
 
 
 def _github_path_segments(url: str) -> list[str] | None:
@@ -164,6 +169,24 @@ class GitHubClient:
             self.session.close()
         except Exception:
             pass
+
+    def refresh_rate_limit(self) -> int | None:
+        """Ask GitHub how many core requests are left. This call itself is free.
+
+        Returns the remaining count (also stored on the client), or None if unknown.
+        """
+        try:
+            response = self.session.get(f"{API_ROOT}/rate_limit", timeout=DEFAULT_TIMEOUT)
+            if response.status_code != 200:
+                return self.rate_limit_remaining
+            core = (self._parse_json(response).get("resources") or {}).get("core") or {}
+            if isinstance(core.get("remaining"), int):
+                self.rate_limit_remaining = core["remaining"]
+            if isinstance(core.get("reset"), int):
+                self.rate_limit_reset_at = core["reset"]
+        except (requests.RequestException, AttributeError, ValueError):
+            pass
+        return self.rate_limit_remaining
 
     def can_afford(self, calls: int) -> bool:
         """True when the core quota is unknown or has more than *calls* requests left."""
@@ -254,11 +277,15 @@ class GitHubClient:
                 f"Invalid repository name format: {full_name!r}. Expected 'owner/repo'."
             )
 
-    def search_repositories(self, query: str, limit: int = 20, sort: str = "stars") -> list[GitHubRepo]:
+    def search_repositories(
+        self, query: str, limit: int = 20, sort: str = "stars", include_forks: bool = False
+    ) -> list[GitHubRepo]:
+        # GitHub hides forks from repository search unless the query asks for them.
+        q = f"{query} fork:true" if include_forks else query
         response = self._request(
             "GET",
             f"{API_ROOT}/search/repositories",
-            params={"q": query, "sort": sort, "order": "desc", "per_page": max(1, min(limit, 50))},
+            params={"q": q, "sort": sort, "order": "desc", "per_page": max(1, min(limit, 50))},
         )
         self._raise_for_status(response, "repository search")
         data = self._parse_json(response)
@@ -299,6 +326,36 @@ class GitHubClient:
         r"|\.msi\b|\.msix\b|\.appx\b|\.appxbundle\b|\.exe\b|setup\.zip)",
         re.IGNORECASE,
     )
+
+    def compare_fork_with_parent(self, full_name: str) -> tuple[str, int, int]:
+        """Return ``(parent_full_name, ahead_by, behind_by)`` for a fork.
+
+        Compares the fork's default branch with its parent's default branch
+        (two API calls). Raises :class:`GitHubError` if the repo isn't a fork
+        or GitHub can't compare them (e.g. unrelated histories).
+        """
+        self._validate_full_name(full_name)
+        response = self._request("GET", f"{API_ROOT}/repos/{full_name}")
+        self._raise_for_status(response, f"repository {full_name}")
+        data = self._parse_json(response)
+        parent = data.get("parent") if isinstance(data, dict) else None
+        if not isinstance(parent, dict) or not parent.get("full_name"):
+            raise GitHubError(f"{full_name} is not a fork.")
+        parent_name = parent["full_name"]
+        parent_branch = parent.get("default_branch") or "main"
+        fork_owner, fork_repo = full_name.split("/", 1)
+        fork_branch = data.get("default_branch") or "main"
+        self._validate_full_name(parent_name)
+        compare_url = (
+            f"{API_ROOT}/repos/{parent_name}/compare/"
+            f"{quote(parent_branch, safe='')}...{fork_owner}:{fork_repo}:{quote(fork_branch, safe='')}"
+        )
+        response = self._request("GET", compare_url)
+        self._raise_for_status(response, f"comparison of {full_name} with {parent_name}")
+        compared = self._parse_json(response)
+        if not isinstance(compared, dict):
+            raise GitHubError("GitHub returned an unexpected comparison format.")
+        return parent_name, int(compared.get("ahead_by") or 0), int(compared.get("behind_by") or 0)
 
     def get_latest_release_info(self, full_name: str) -> tuple[str, bool]:
         """Return ``(published_at, has_windows_asset)`` for the latest release.
@@ -378,6 +435,7 @@ class GitHubClient:
             updated_at=item.get("updated_at", ""),
             default_branch=item.get("default_branch", "main"),
             pushed_at=item.get("pushed_at", ""),
+            is_fork=bool(item.get("fork", False)),
         )
 
     @staticmethod
