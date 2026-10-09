@@ -274,6 +274,14 @@ class AppController:
                 roots.setdefault(normalize_dir(parent), parent)
         return sum(fsops.cleanup_stale_temp_dirs(root) for root in roots.values())
 
+    def set_pinned(self, program_id: str, pinned: bool) -> ManagedProgram:
+        """Pin/unpin a program in the tray's quick-launch menu."""
+        with self._lock:
+            program = self._get_program_no_lock(program_id)
+            program.pinned = bool(pinned)
+            self.storage.save_programs(self.programs)
+            return copy.deepcopy(program)
+
     def edit_program(
         self,
         program_id: str,
