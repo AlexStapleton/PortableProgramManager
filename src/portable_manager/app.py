@@ -14,7 +14,7 @@ from .single_instance import SingleInstance, default_instance_key
 from .storage import Storage
 from .ui.icons import make_window_icon
 from .ui.main_window import MainWindow
-from .ui.theme import APP_STYLESHEET
+from .ui.theme import apply_theme, install_title_bar_sync
 from .winutil import is_elevated, is_windows
 
 log = logging.getLogger(__name__)
@@ -56,7 +56,8 @@ def main() -> int:
     # and the taskbar thumbnail uses the correct icon.
     app.setWindowIcon(make_window_icon())
     app.setStyle("Fusion")
-    app.setStyleSheet(APP_STYLESHEET)
+    apply_theme(app, storage.load_settings().theme)
+    install_title_bar_sync(app)
     # Keep the process alive when the main window is hidden to the system tray.
     app.setQuitOnLastWindowClosed(False)
 
