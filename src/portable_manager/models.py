@@ -290,6 +290,15 @@ class AppSettings:
     # Code-hosting sites to search and install from (see SourceConfig).
     sources: list[SourceConfig] = field(default_factory=default_sources)
 
+    def __post_init__(self) -> None:
+        # The GitHub source owns the token; github_token mirrors it so older code
+        # keeps working. A token given only on the legacy field is moved over.
+        github = self.source("github")
+        if github is not None:
+            if self.github_token and not github.token:
+                github.token = self.github_token
+            self.github_token = github.token
+
     def source(self, source_id: str) -> SourceConfig | None:
         return next((s for s in self.sources if s.id == source_id), None)
 
