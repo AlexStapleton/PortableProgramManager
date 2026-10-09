@@ -1,0 +1,7 @@
+cd "I:\Coding Projects\portable-program-manager\portable_program_manager"
+.venv\Scripts\activate
+py -m pip install --upgrade pip
+py -m pip install -r requirements.txt
+py -m pip install --upgrade pyinstaller
+py -m PyInstaller --noconfirm PortableProgramManager.spec
+# THIS IS OLD py -m PyInstaller --noconfirm --onefile --windowed --icon PortableProgramManager_icon_transparent.ico --name PortableProgramManager --paths src main.py

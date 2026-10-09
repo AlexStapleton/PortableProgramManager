@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# PyInstaller output
+build/
+dist/
+
+# Local tooling
+.claude/settings.local.json
+.vscode/
+.idea/
+
+# Archives / runtime data
+*.zip
+*.log
