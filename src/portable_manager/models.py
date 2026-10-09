@@ -1,12 +1,137 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict, fields
+import functools
+import types
+from dataclasses import MISSING, Field, asdict, dataclass, field, fields
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional, Union, get_args, get_origin, get_type_hints
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ── Type-safe loading of JSON payloads ────────────────────────────────────
+#
+# Registry and settings files are hand-editable JSON, so a value can arrive
+# with any JSON type. These helpers coerce each value to the field's declared
+# type and fall back to the field default when that is not possible, so bad
+# data never reaches the UI as the wrong type.
+
+_TRUE_STRINGS = frozenset({"true", "1", "yes"})
+_FALSE_STRINGS = frozenset({"false", "0", "no"})
+
+
+@functools.cache
+def _type_hints(cls: type) -> dict[str, Any]:
+    """Resolved annotations for *cls* (they are strings under ``from __future__``)."""
+    return get_type_hints(cls)
+
+
+def _field_default(f: Field) -> Any:
+    """The field's default, calling its factory if needed. ``MISSING`` if it has none."""
+    if f.default is not MISSING:
+        return f.default
+    if f.default_factory is not MISSING:
+        return f.default_factory()
+    return MISSING
+
+
+def _is_required(f: Field) -> bool:
+    return f.default is MISSING and f.default_factory is MISSING
+
+
+def _default_of(cls: type, name: str) -> Any:
+    return _field_default(next(f for f in fields(cls) if f.name == name))
+
+
+def _strip_optional(hint: Any) -> Any:
+    """Return ``T`` for ``Optional[T]`` / ``T | None``; any other hint is returned unchanged."""
+    if get_origin(hint) in (Union, types.UnionType):
+        args = [arg for arg in get_args(hint) if arg is not type(None)]
+        if len(args) == 1:
+            return args[0]
+    return hint
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_STRINGS:
+            return True
+        if text in _FALSE_STRINGS:
+            return False
+    return None
+
+
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool):  # bool is an int subclass; treat it as invalid here
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            return int(text)
+        except ValueError:
+            pass
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+        return int(number) if number.is_integer() else None
+    return None
+
+
+def _coerce_field(hint: Any, value: Any) -> Any:
+    """Convert one JSON *value* to the declared *hint*.
+
+    Returns ``None`` when the value cannot be used, which tells the caller to
+    fall back to the field default.
+    """
+    if value is None:
+        return None
+    inner = _strip_optional(hint)
+    if inner is UpdatePolicy:
+        return UpdatePolicy.from_dict(value) if isinstance(value, dict) else None
+    if get_origin(inner) is list:
+        if not isinstance(value, list):
+            return None
+        return [item for item in value if isinstance(item, str)]
+    if inner is bool:
+        return _coerce_bool(value)
+    if inner is int:
+        return _coerce_int(value)
+    if inner is str:
+        return value if isinstance(value, str) else str(value)
+    return value
+
+
+def _coerce_payload(cls: type, payload: Any) -> dict[str, Any]:
+    """Return ``{field: coerced value}`` for every field of dataclass *cls*.
+
+    Unknown keys are dropped. Missing or unusable values take the field default.
+    Fields with no default must end up as non-empty values, otherwise a
+    ``ValueError`` is raised.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError(f"{cls.__name__} payload must be a JSON object, got {type(payload).__name__}")
+    hints = _type_hints(cls)
+    values: dict[str, Any] = {}
+    for f in fields(cls):
+        value = _coerce_field(hints[f.name], payload.get(f.name))
+        if value is None:
+            value = _field_default(f)
+        if _is_required(f) and (value is MISSING or (isinstance(value, str) and not value.strip())):
+            raise ValueError(f"{cls.__name__} missing required field {f.name}")
+        values[f.name] = value
+    return values
 
 
 @dataclass
@@ -24,10 +149,13 @@ class UpdatePolicy:
 
     @classmethod
     def from_dict(cls, payload: dict | None) -> "UpdatePolicy":
-        if not payload:
-            return cls()
-        known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in payload.items() if k in known})
+        if not isinstance(payload, dict):
+            payload = {}
+        values = _coerce_payload(cls, payload)
+        # An update check must run at least once an hour; anything smaller falls back to the default.
+        if values["interval_hours"] < 1:
+            values["interval_hours"] = _default_of(cls, "interval_hours")
+        return cls(**values)
 
 
 @dataclass
@@ -75,16 +203,8 @@ class ManagedProgram:
 
     @classmethod
     def from_dict(cls, payload: dict) -> "ManagedProgram":
-        payload = dict(payload)
-        payload["update_policy"] = UpdatePolicy.from_dict(payload.get("update_policy"))
-        # Sanitize list/str fields that may be stored as null in legacy JSON.
-        if not isinstance(payload.get("tags"), list):
-            payload["tags"] = []
-        for str_field in ("notes", "launch_args"):
-            if payload.get(str_field) is None:
-                payload[str_field] = ""
-        known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in payload.items() if k in known})
+        # Legacy null tags/notes/launch_args and non-dict update_policy are handled by the coercion rules.
+        return cls(**_coerce_payload(cls, payload))
 
 
 @dataclass
@@ -107,5 +227,9 @@ class AppSettings:
 
     @classmethod
     def from_dict(cls, payload: dict) -> "AppSettings":
-        known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in payload.items() if k in known})
+        values = _coerce_payload(cls, payload)
+        if values["default_update_interval_hours"] < 1:
+            values["default_update_interval_hours"] = _default_of(cls, "default_update_interval_hours")
+        # Keep the result list within the range the search UI supports.
+        values["search_result_limit"] = min(max(values["search_result_limit"], 5), 50)
+        return cls(**values)
