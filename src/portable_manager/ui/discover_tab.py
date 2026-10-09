@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import Qt, QUrl, Signal
-from PySide6.QtGui import QBrush, QColor, QDesktopServices, QPalette
+from PySide6.QtGui import QBrush, QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -41,7 +41,7 @@ from ..controller import InstallOutcome
 from ..github_client import GitHubRepo
 from ..models import ManagedProgram
 from .host import TaskHost
-from .theme import is_dark, status_color
+from .theme import status_color
 
 
 # Substrings (checked against repo name + description) that strongly suggest
@@ -387,12 +387,7 @@ class DiscoverTab(QWidget):
         table.setHorizontalHeaderLabels(_HEADERS)
         table.verticalHeader().hide()
         table.setShowGrid(False)
-        table.setAlternatingRowColors(True)
-        # Qt's default alternate colour is light; with light text on dark themes
-        # every second row would be unreadable, so pick one that matches the theme.
-        palette = table.palette()
-        palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#18212f") if is_dark() else QColor("#f3f4f6"))
-        table.setPalette(palette)
+        table.setAlternatingRowColors(True)  # colours come from the theme palette
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
