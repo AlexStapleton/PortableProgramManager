@@ -22,7 +22,7 @@ COMPANY_NAME = "Alex Stapleton"
 FILE_DESCRIPTION = "Portable Program Manager"
 INTERNAL_NAME = "PortableProgramManager"
 ORIGINAL_FILENAME = "PortableProgramManager.exe"
-LEGAL_COPYRIGHT = "GPL-3.0"
+LEGAL_COPYRIGHT = "Copyright (C) 2026 Alex Stapleton. Licensed under the GPL-3.0."
 
 _VERSION_LINE_RE = re.compile(r"""^__version__\s*=\s*["']([^"']+)["']""", re.MULTILINE)
 # Leading numeric part only: "0.8.0" -> "0.8.0"; "0.8.0-beta.1" -> "0.8.0".

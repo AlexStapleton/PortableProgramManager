@@ -20,7 +20,7 @@ VSVersionInfo(
         StringStruct('FileDescription', 'Portable Program Manager'),
         StringStruct('FileVersion', '0.8.0.0'),
         StringStruct('InternalName', 'PortableProgramManager'),
-        StringStruct('LegalCopyright', 'GPL-3.0'),
+        StringStruct('LegalCopyright', 'Copyright (C) 2026 Alex Stapleton. Licensed under the GPL-3.0.'),
         StringStruct('OriginalFilename', 'PortableProgramManager.exe'),
         StringStruct('ProductName', 'Portable Program Manager'),
         StringStruct('ProductVersion', '0.8.0.0')])
