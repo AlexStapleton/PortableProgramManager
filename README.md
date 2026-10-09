@@ -50,7 +50,9 @@ python -m pip install -r requirements-dev.txt
 python tools\make_version_info.py
 python -m PyInstaller --noconfirm --clean PortableProgramManager.spec
 ```
-The result is `dist\PortableProgramManager.exe`. Run `tools\make_version_info.py` again after changing `__version__` in `src/portable_manager/__init__.py`.
+The result is `dist\PortableProgramManager.exe`.
+
+GitHub Actions builds the exe on every push to `main` (download it from the run's **Artifacts**), and on a version tag such as `v0.9.0` it also publishes a GitHub Release with the exe and its SHA-256 attached. You can also start a build by hand from **Actions → Build exe → Run workflow**. Run `tools\make_version_info.py` again after changing `__version__` in `src/portable_manager/__init__.py`.
 
 ## Tests
 ```bash
